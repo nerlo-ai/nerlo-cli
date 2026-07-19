@@ -19,7 +19,6 @@ records the repository and the user finishes the command wiring — the
 registry verifies code, it does not (yet) ship a package runtime.
 """
 
-import asyncio
 import contextlib
 import json
 import os
