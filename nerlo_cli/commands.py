@@ -1,22 +1,18 @@
-"""Nerlo CLI consumer/operator commands — Task 20.1, Req 11.1-11.13.
+"""Nerlo registry CLI commands — search, info, install, submit, rescan.
 
-Registry-facing commands talk HTTP to the API Gateway (`NERLO_API_BASE_URL`,
-default http://localhost:8000); write operations authenticate with a
-Bearer token (`--token` / `NERLO_API_TOKEN`, Req 11.10) and exit non-zero
-without acting when the credential is missing or rejected (Req 11.11).
-`jobs` reads the operator's own database directly (no public endpoint —
-same pattern as `vsk seed-api-key`), and `verify` runs the scan pipeline
-locally (requires Docker + the configured database).
+Every command talks HTTP to the public Nerlo registry API (`NERLO_API_BASE_URL`,
+default https://api.nerlo.ai); write operations (`submit`, `rescan`)
+authenticate with a Bearer token (`--token` / `NERLO_API_TOKEN`) and exit
+non-zero without acting when the credential is missing or rejected.
 
 Every command supports `--json` for machine output; the default is a
-human-readable table (Req 11.13).
+human-readable table.
 
-`install` writes an `mcpServers` entry into the target platform config
-(Req 11.1) with badge gating per Req 11.2: Verified proceeds, Caution
-prompts for confirmation, Unsafe refuses. For npm-hosted packages the
-entry is runnable (`npx -y <package>`); for other sources the entry
-records the repository and the user finishes the command wiring — the
-registry verifies code, it does not (yet) ship a package runtime.
+`install` writes an `mcpServers` entry into the target platform config with
+badge gating: Verified proceeds, Caution prompts for confirmation, Unsafe
+refuses. For npm-hosted packages the entry is runnable (`npx -y <package>`);
+for other sources the entry records the repository and the user finishes the
+command wiring — Nerlo verifies code, it does not (yet) ship a package runtime.
 """
 
 import contextlib
@@ -118,7 +114,7 @@ def _table(rows: list[dict[str, Any]], columns: list[str]) -> None:
 
 
 # --------------------------------------------------------------------- #
-# vsk search (Req 11.3, 11.4)                                            #
+# nerlo search (Req 11.3, 11.4)                                            #
 # --------------------------------------------------------------------- #
 
 
@@ -161,7 +157,7 @@ def search(query: str, api_url: str, as_json: bool) -> None:
 
 
 # --------------------------------------------------------------------- #
-# vsk info (Req 11.9)                                                    #
+# nerlo info (Req 11.9)                                                    #
 # --------------------------------------------------------------------- #
 
 
@@ -246,7 +242,7 @@ def _resolve_server_id(client: httpx.Client, skill_name: str, skill: dict[str, A
 
 
 # --------------------------------------------------------------------- #
-# vsk install (Req 11.1, 11.2)                                           #
+# nerlo install (Req 11.1, 11.2)                                           #
 # --------------------------------------------------------------------- #
 
 
@@ -339,7 +335,7 @@ def _build_mcp_entry(skill: dict[str, Any]) -> dict[str, Any]:
         package = urlparse(repo).path.split("/project/")[-1].strip("/")
         if package:
             return {"command": "uvx", "args": [package]}
-    return {"repository": repo, "vsk_badge": skill.get("current_badge")}
+    return {"repository": repo, "nerlo_badge": skill.get("current_badge")}
 
 
 def _write_mcp_entry(
@@ -365,7 +361,7 @@ def _write_mcp_entry(
     servers[skill_id] = entry
     # Atomic replace: this file can be the user's live Claude Code state
     # (~/.claude.json); a torn write must never destroy it.
-    fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".vsk-tmp")
+    fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".nerlo-tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(config, indent=2) + "\n")
@@ -377,7 +373,7 @@ def _write_mcp_entry(
 
 
 # --------------------------------------------------------------------- #
-# vsk submit / rescan (Req 11.6, 11.7, 11.10, 11.11)                     #
+# nerlo submit / rescan (Req 11.6, 11.7, 11.10, 11.11)                     #
 # --------------------------------------------------------------------- #
 
 
