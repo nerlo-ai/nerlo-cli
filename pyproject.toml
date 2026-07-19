@@ -1,0 +1,27 @@
+[project]
+name = "nerlo"
+version = "0.1.0"
+description = "Nerlo CLI — search, inspect, and install MCP servers from the Nerlo security registry"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"                      # @NERLO-REVIEW: Topher to confirm (MIT vs Apache-2.0)
+authors = [{ name = "Nerlo" }]
+keywords = ["mcp", "security", "registry", "cli", "nerlo"]
+dependencies = [
+    "click>=8.1",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://nerlo.ai"
+Registry = "https://nerlo.ai/servers"
+
+[project.scripts]
+nerlo = "nerlo_cli.main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nerlo_cli"]
