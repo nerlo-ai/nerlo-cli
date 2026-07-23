@@ -8,17 +8,26 @@ non-zero without acting when the credential is missing or rejected.
 Every command supports `--json` for machine output; the default is a
 human-readable table.
 
-`install` writes an `mcpServers` entry into the target platform config with
-badge gating: Verified proceeds, Caution prompts for confirmation, Unsafe
-refuses. For npm-hosted packages the entry is runnable (`npx -y <package>`);
-for other sources the entry records the repository and the user finishes the
-command wiring — Nerlo verifies code, it does not (yet) ship a package runtime.
+`install` routes by the resolved artifact's `artifact_type` (Ticket 33.9):
+`mcp_server` writes an `mcpServers` entry into the target platform config;
+`claude_skill` copy-installs the skill directory (the one containing SKILL.md,
+materialised via a shallow `git clone` of the repository) into
+`~/.claude/skills/<skill-slug>/`; `gemini_extension` is a placeholder (install
+path pending Google runtime API); `cursor_rule` is refused. All installs are
+badge gated: Verified proceeds, Caution prompts for confirmation, Unsafe
+refuses. For npm-hosted packages the mcpServers entry is runnable
+(`npx -y <package>`); for other sources the entry records the repository and
+the user finishes the command wiring — Nerlo verifies code, it does not (yet)
+ship a package runtime.
 """
 
 import contextlib
 import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import uuid as uuid_mod
@@ -41,15 +50,22 @@ HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 # the timeout short and swallow every failure.
 TELEMETRY_TIMEOUT = httpx.Timeout(3.0, connect=2.0)
 
-# Artifact types the backend recognises (Ticket 33.9). `nerlo install` only has
-# a defined local install action for `mcp_server` (writing an mcpServers config
-# entry); the others land in platform-specific locations this thin client does
-# not manage yet, so it refuses rather than guessing a path.
+# Artifact types the backend recognises (Ticket 33.9). `nerlo install` routes
+# by type: mcp_server writes an mcpServers config entry, claude_skill
+# copy-installs into ~/.claude/skills/, gemini_extension is a placeholder
+# (install path pending Google runtime API). cursor_rule lands in a
+# platform-specific location this thin client does not manage yet, so it
+# refuses rather than guessing a path.
 SUBMIT_ARTIFACT_TYPES = ("mcp_server", "claude_skill", "gemini_extension", "cursor_rule")
-# TODO(nerlo): teach `install` to place claude_skill (skills dir),
-# gemini_extension (extensions), and cursor_rule (rules dir) artifacts once
-# those install paths are specified; until then only mcp_server is installable.
+# TODO(nerlo): teach `install` to place cursor_rule (rules dir) artifacts once
+# that install path is specified.
 MCP_INSTALLABLE_ARTIFACT_TYPES = frozenset({"mcp_server"})
+INSTALL_ROUTABLE_ARTIFACT_TYPES = frozenset({"mcp_server", "claude_skill", "gemini_extension"})
+# Shallow clone used to materialise claude_skill sources — best-effort, bounded.
+GIT_CLONE_TIMEOUT_SECONDS = 120.0
+# Directory names under ~/.claude/skills/ come from the API's skill slug; keep
+# them strictly path-safe (no separators, no traversal) before touching disk.
+_SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Req 11.1 target platforms -> local MCP config file (entries land under
 # the file's "mcpServers" object in every case).
@@ -160,6 +176,8 @@ def search(query: str, api_url: str, as_json: bool) -> None:
         [
             {
                 "name": r.get("name"),
+                # Ticket 33.9: surface the artifact type alongside every result.
+                "type": r.get("artifact_type"),
                 "score": r.get("current_security_score"),
                 "badge": r.get("current_badge"),
                 "author": r.get("author"),
@@ -167,7 +185,7 @@ def search(query: str, api_url: str, as_json: bool) -> None:
             }
             for r in results
         ],
-        ["name", "score", "badge", "author", "id"],
+        ["name", "type", "score", "badge", "author", "id"],
     )
 
 
@@ -200,6 +218,9 @@ def info(skill_name: str, api_url: str, as_json: bool) -> None:
         return
     click.secho(f"{skill.get('name')} ({skill.get('skill_id')})", bold=True)
     click.echo(f"  repository: {skill.get('repository_url', '-')}")
+    # Ticket 33.9: artifact type is part of the human summary (and the raw
+    # `--json` skill object already carries it through unmodified).
+    click.echo(f"  type:       {skill.get('artifact_type') or '-'}")
     click.echo(f"  badge:      {skill.get('current_badge', '-')}")
     click.echo(f"  score:      {skill.get('current_security_score', '-')}")
     if install_stats is not None:
@@ -404,7 +425,11 @@ def _emit_install_event(api_url: str, target: str, token: str | None) -> None:
     type=click.Choice(sorted(TARGET_CONFIG_PATHS)),
     help="AI platform whose local config receives the entry.",
 )
-@click.option("--force", is_flag=True, help="Replace an existing mcpServers entry for this skill.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace an existing install (mcpServers entry or skills directory) for this skill.",
+)
 @_api_url_option
 @_token_option
 @_json_option
@@ -416,27 +441,64 @@ def install(
     token: str | None,
     as_json: bool,
 ) -> None:
-    """Install a verified skill into a platform's MCP configuration.
+    """Install a verified skill, routed by its artifact type.
 
-    Writes an mcpServers config entry (runnable for npm/PyPI-hosted
-    packages; a repository reference otherwise — finish the command
-    wiring manually for those). Authenticated per Req 11.10.
+    mcp_server artifacts get an mcpServers config entry (runnable for
+    npm/PyPI-hosted packages; a repository reference otherwise — finish
+    the command wiring manually for those). claude_skill artifacts are
+    copy-installed into ~/.claude/skills/<skill-slug>/. Authenticated
+    per Req 11.10.
     """
     auth = _require_token(token)
     with _client(api_url, auth) as client:
         skill = _resolve_skill(client, skill_name)
 
-    # Ticket 33.9: type-aware install. Only `mcp_server` artifacts have a
-    # defined local install action here (writing an mcpServers entry). For any
-    # other classified type, refuse with a clear message rather than guessing a
-    # path (a skills/extension/rules artifact is NOT an mcpServers entry).
-    artifact_type = skill.get("artifact_type")
-    if artifact_type is not None and artifact_type not in MCP_INSTALLABLE_ARTIFACT_TYPES:
+    # Ticket 33.9: type-aware install, routed on the resolved artifact_type.
+    # Legacy rows without a type are mcp_server (matches the backend default).
+    artifact_type = str(skill.get("artifact_type") or "mcp_server")
+    if artifact_type not in INSTALL_ROUTABLE_ARTIFACT_TYPES:
+        # cursor_rule (and any future unknown type) lands in a location this
+        # thin client does not manage — refuse rather than guessing a path.
         _fail(
             f"{skill_name!r} is a {artifact_type!r} artifact — `nerlo install` "
             "can only write MCP server config entries so far. Install it "
             "manually per your platform's docs (install support for "
             f"{artifact_type} is planned)."
+        )
+
+    if artifact_type == "gemini_extension":
+        # Ticket 33.9: placeholder route — Google has not published a local
+        # runtime install location yet, so this exits 0 without writing
+        # anything. @NERLO-REVIEW: runs before the badge gate on purpose — the
+        # ticket mandates exit 0 and nothing is written, so the gate has
+        # nothing to protect; re-place the gate when the real install lands.
+        logger.info(
+            "cli.install",
+            skill_id=skill.get("skill_id"),
+            artifact_type=artifact_type,
+            status="placeholder",
+            reason="install path pending Google runtime API",
+        )
+        if as_json:
+            _echo_json(
+                {
+                    "installed": None,
+                    "artifact_type": artifact_type,
+                    "status": "install path pending Google runtime API",
+                }
+            )
+            return
+        click.secho(
+            f"{skill_name!r} is a gemini_extension — install path pending "
+            "Google runtime API; nothing was written.",
+            fg="yellow",
+        )
+        return
+
+    if artifact_type == "claude_skill" and target != "claude-code":
+        _fail(
+            f"{skill_name!r} is a claude_skill artifact — it installs into "
+            "Claude Code's skills directory. Re-run with --target claude-code."
         )
 
     badge = skill.get("current_badge")
@@ -454,6 +516,36 @@ def install(
             sys.exit(1)
     elif badge != "Verified":
         _fail(f"{skill_name!r} has no badge yet (status: {badge!r}) — not installable")
+
+    if artifact_type == "claude_skill":
+        # Ticket 33.9: copy-install the skill directory into
+        # ~/.claude/skills/<skill-slug>/ (materialised via shallow git clone —
+        # the API carries only the repository URL, not the file tree).
+        skill_slug = str(skill.get("skill_id") or skill_name)
+        dest = _install_claude_skill(skill, skill_slug, force=force)
+        logger.info(
+            "cli.install",
+            skill_id=skill.get("skill_id"),
+            artifact_type=artifact_type,
+            target="claude-code",
+            badge=badge,
+            path=str(dest),
+        )
+        # Ticket 30.5 telemetry — claude_skill installs report target_platform
+        # "claude-code" (the only runtime that consumes ~/.claude/skills).
+        _emit_install_event(api_url, "claude-code", token)
+        if as_json:
+            _echo_json(
+                {
+                    "installed": skill.get("skill_id"),
+                    "artifact_type": artifact_type,
+                    "target": "claude-code",
+                    "path": str(dest),
+                }
+            )
+            return
+        click.secho(f"Installed {skill.get('skill_id')} -> {dest}", fg="green")
+        return
 
     config_path = TARGET_CONFIG_PATHS[target]
     entry = _build_mcp_entry(skill)
@@ -535,6 +627,124 @@ def _write_mcp_entry(
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
+# --------------------------------------------------------------------- #
+# claude_skill copy-install (Ticket 33.9)                                  #
+# --------------------------------------------------------------------- #
+
+
+def _claude_skills_dir() -> Path:
+    """Claude Code's per-user skills directory.
+
+    Plain `Path.home()` — the CLI has no env override pattern for `~/.claude`
+    (`NERLO_HOME` governs only `~/.nerlo`), matching TARGET_CONFIG_PATHS.
+    """
+    return Path.home() / ".claude" / "skills"
+
+
+def _git_shallow_clone(repo_url: str, dest: Path) -> None:
+    """Best-effort `git clone --depth 1` of `repo_url` into `dest`.
+
+    `git` is invoked via the stdlib subprocess (not a package dependency);
+    every failure mode surfaces as a clear CLI error, never a traceback.
+    """
+    parsed = urlparse(repo_url)
+    # http(s) only — refuses git's other transports (ssh, file, ext::) so a
+    # registry-supplied URL can never smuggle a local command or path.
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        _fail(f"cannot clone {repo_url!r} — only http(s) repository URLs are supported")
+    try:
+        # Fixed argv (no shell); `--` stops a URL from being parsed as an option.
+        completed = subprocess.run(
+            ["git", "clone", "--depth", "1", "--", repo_url, str(dest)],
+            capture_output=True,
+            text=True,
+            timeout=GIT_CLONE_TIMEOUT_SECONDS,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},  # never hang on a prompt
+            check=False,  # non-zero handled below with a clear CLI error
+        )
+    except FileNotFoundError:
+        _fail(
+            "installing a claude_skill needs `git` to fetch the skill source, "
+            "but `git` was not found on PATH — install git and retry"
+        )
+        raise AssertionError from None  # unreachable; _fail exits
+    except subprocess.TimeoutExpired:
+        _fail(f"git clone of {repo_url} timed out after {GIT_CLONE_TIMEOUT_SECONDS:.0f}s")
+        raise AssertionError from None  # unreachable; _fail exits
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        _fail(
+            f"git clone of {repo_url} failed (exit {completed.returncode})"
+            + (f": {detail[-1][:200]}" if detail else "")
+        )
+
+
+def _find_skill_dir(root: Path, slug: str, name: str) -> Path:
+    """Locate the skill directory (the one containing SKILL.md) under `root`.
+
+    Refuses (clear error, no guessing) when no SKILL.md exists, or when
+    several exist and none of their directories matches the skill's slug/name.
+    """
+    if (root / "SKILL.md").is_file():
+        return root
+    candidates = sorted(
+        {p.parent for p in root.rglob("SKILL.md") if p.is_file() and ".git" not in p.parts},
+        key=lambda d: (len(d.parts), str(d)),
+    )
+    if not candidates:
+        _fail(
+            "no SKILL.md found in the repository — cannot identify a skill "
+            "directory to install (refusing to guess)"
+        )
+    if len(candidates) == 1:
+        return candidates[0]
+    for candidate in candidates:
+        if candidate.name in (slug, name):
+            return candidate
+    _fail(
+        f"multiple SKILL.md files found and none of their directories is named "
+        f"{slug!r} — cannot identify which skill to install (refusing to guess)"
+    )
+    raise AssertionError  # unreachable; _fail exits
+
+
+def _install_claude_skill(skill: dict[str, Any], slug: str, *, force: bool) -> Path:
+    """Copy-install a claude_skill into `~/.claude/skills/<slug>/`.
+
+    The registry API carries only the repository URL (no file tree), so the
+    source is materialised via a shallow clone into a temp dir, then the
+    directory containing SKILL.md is copied into place.
+    """
+    if not _SAFE_SLUG.match(slug):
+        _fail(f"skill slug {slug!r} is not a safe directory name — refusing to install")
+    repo_url = str(skill.get("repository_url") or "")
+    if not repo_url:
+        _fail("skill record carries no repository_url — nothing to install from")
+    skills_root = _claude_skills_dir()
+    dest = skills_root / slug
+    if dest.exists() and not force:
+        _fail(f"{dest} already exists — re-run with --force to replace it")
+    with tempfile.TemporaryDirectory(prefix="nerlo-skill-") as tmp:
+        clone_dir = Path(tmp) / "repo"
+        _git_shallow_clone(repo_url, clone_dir)
+        skill_dir = _find_skill_dir(clone_dir, slug, str(skill.get("name") or ""))
+        skills_root.mkdir(parents=True, exist_ok=True)
+        # Stage next to the destination, then swap — never leave a half-copied
+        # skill dir where Claude Code would load it.
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{slug}.", suffix=".nerlo-tmp", dir=skills_root)
+        )
+        try:
+            staged = staging / slug
+            shutil.copytree(skill_dir, staged, ignore=shutil.ignore_patterns(".git"))
+            if dest.exists():  # only reachable with --force
+                shutil.rmtree(dest)
+            os.replace(staged, dest)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    return dest
 
 
 # --------------------------------------------------------------------- #

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -431,14 +432,19 @@ def test_submit_rejects_unknown_type() -> None:
     assert "bogus" in _combined(result)
 
 
-def _typed_skill_handler(artifact_type: str | None) -> Handler:
+def _typed_skill_handler(
+    artifact_type: str | None,
+    *,
+    badge: str | None = "Verified",
+    repo: str = "https://www.npmjs.com/package/demo",
+) -> Handler:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.startswith("/api/v1/skills/"):
             body: dict[str, Any] = {
                 "skill_id": "demo-skill",
                 "name": "demo",
-                "current_badge": "Verified",
-                "repository_url": "https://www.npmjs.com/package/demo",
+                "current_badge": badge,
+                "repository_url": repo,
             }
             if artifact_type is not None:
                 body["artifact_type"] = artifact_type
@@ -448,15 +454,19 @@ def _typed_skill_handler(artifact_type: str | None) -> Handler:
     return handler
 
 
-def test_install_refuses_non_mcp_artifact_type(
+def test_install_cursor_rule_still_refuses(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    # cursor_rule has no defined install action in the ticket — the existing
+    # clear refusal (no path guessing, nothing written) must be preserved.
     config = tmp_path / "mcp.json"
     monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
-    _use_handler(monkeypatch, _typed_skill_handler("claude_skill"))
+    _use_handler(monkeypatch, _typed_skill_handler("cursor_rule"))
     result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
     assert result.exit_code == 1
-    assert "claude_skill" in _combined(result)
+    combined = _combined(result)
+    assert "cursor_rule" in combined
+    assert "can only write MCP server config entries" in combined
     assert not config.exists()  # nothing written for an unsupported type
 
 
@@ -472,3 +482,213 @@ def test_install_allows_mcp_server_artifact_type(
     assert result.exit_code == 0, _combined(result)
     written = json.loads(config.read_text(encoding="utf-8"))
     assert "demo-skill" in written["mcpServers"]
+
+
+# --------------------------------------------------------------------------- #
+# artifact_type display in search/info (Ticket 33.9)                          #
+# --------------------------------------------------------------------------- #
+
+
+def _search_results_handler(results: list[dict[str, Any]]) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(request, 200, {"results": results})
+
+    return handler
+
+
+def test_search_table_shows_artifact_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    results = [
+        {
+            "name": "alpha",
+            "artifact_type": "claude_skill",
+            "current_security_score": 88.0,
+            "current_badge": "Verified",
+            "author": "a",
+            "id": "1",
+        }
+    ]
+    _use_handler(monkeypatch, _search_results_handler(results))
+    result = CliRunner().invoke(commands.search, ["alpha"])
+    assert result.exit_code == 0, _combined(result)
+    assert "TYPE" in result.output  # table header column
+    assert "claude_skill" in result.output
+
+
+def test_search_json_includes_artifact_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    results = [
+        {"name": "alpha", "artifact_type": "gemini_extension", "current_badge": "Verified"}
+    ]
+    _use_handler(monkeypatch, _search_results_handler(results))
+    result = CliRunner().invoke(commands.search, ["alpha", "--json"])
+    assert result.exit_code == 0, _combined(result)
+    parsed = _json_payload(result)
+    assert parsed[0]["artifact_type"] == "gemini_extension"
+
+
+def _info_handler(artifact_type: str) -> Handler:
+    """Skill detail with an artifact_type; server-id resolution finds nothing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/api/v1/skills/"):
+            return _json_response(
+                request,
+                200,
+                {
+                    "skill_id": "demo-skill",
+                    "name": "demo",
+                    "artifact_type": artifact_type,
+                    "current_badge": "Verified",
+                    "current_security_score": 91.0,
+                    "repository_url": "https://github.com/o/r",
+                },
+            )
+        return _json_response(request, 200, {"results": []})
+
+    return handler
+
+
+def test_info_table_shows_artifact_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_handler(monkeypatch, _info_handler("claude_skill"))
+    result = CliRunner().invoke(commands.info, ["demo"])
+    assert result.exit_code == 0, _combined(result)
+    assert "type:" in result.output
+    assert "claude_skill" in result.output
+
+
+def test_info_json_includes_artifact_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_handler(monkeypatch, _info_handler("cursor_rule"))
+    result = CliRunner().invoke(commands.info, ["demo", "--json"])
+    assert result.exit_code == 0, _combined(result)
+    parsed = _json_payload(result)
+    assert parsed["skill"]["artifact_type"] == "cursor_rule"
+
+
+# --------------------------------------------------------------------------- #
+# claude_skill copy-install + gemini placeholder (Ticket 33.9)                #
+# --------------------------------------------------------------------------- #
+
+_SKILL_REPO_URL = "https://github.com/o/skill-repo"
+
+
+def _fake_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point `Path.home()` (hence ~/.claude/skills) at an isolated tmp home."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    return home
+
+
+def _stub_git_clone(
+    monkeypatch: pytest.MonkeyPatch, populate: Callable[[Path], None]
+) -> list[list[str]]:
+    """Stub `subprocess.run` for the shallow-clone path — no real network/git.
+
+    Records each argv; `populate` builds the cloned tree at the clone dest.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        assert args[:4] == ["git", "clone", "--depth", "1"]
+        dest = Path(args[-1])
+        dest.mkdir(parents=True, exist_ok=True)
+        populate(dest)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(commands.subprocess, "run", fake_run)
+    return calls
+
+
+def _populate_skill_repo(dest: Path) -> None:
+    """A repo whose skill lives in a nested directory (not the repo root)."""
+    skill_dir = dest / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# demo skill\n", encoding="utf-8")
+    (skill_dir / "scripts").mkdir()
+    (skill_dir / "scripts" / "run.py").write_text("print('hi')\n", encoding="utf-8")
+    (dest / "README.md").write_text("repo readme\n", encoding="utf-8")
+
+
+def test_install_claude_skill_copies_skill_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    calls = _stub_git_clone(monkeypatch, _populate_skill_repo)
+    posts: list[httpx.Request] = []
+    monkeypatch.setattr(commands, "_telemetry_client", _recording_telemetry_client(posts))
+    _use_handler(monkeypatch, _typed_skill_handler("claude_skill", repo=_SKILL_REPO_URL))
+    result = CliRunner().invoke(
+        commands.install, ["demo", "--target", "claude-code", "--token", "t"]
+    )
+    assert result.exit_code == 0, _combined(result)
+    installed = home / ".claude" / "skills" / "demo-skill"
+    assert (installed / "SKILL.md").read_text(encoding="utf-8") == "# demo skill\n"
+    assert (installed / "scripts" / "run.py").exists()
+    assert not (installed / "README.md").exists()  # only the skill dir, not the repo
+    # The clone was shallow and pointed at the skill's repository URL.
+    assert len(calls) == 1
+    assert _SKILL_REPO_URL in calls[0]
+    # Telemetry reports target_platform "claude-code" for claude_skill installs.
+    assert len(posts) == 1
+    assert json.loads(posts[0].content)["target_platform"] == "claude-code"
+
+
+def test_install_claude_skill_requires_claude_code_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    _use_handler(monkeypatch, _typed_skill_handler("claude_skill", repo=_SKILL_REPO_URL))
+    result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    assert result.exit_code == 1
+    assert "claude-code" in _combined(result)
+    assert not (home / ".claude").exists()  # nothing written
+
+
+def test_install_claude_skill_refuses_without_skill_md(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+
+    def populate_no_skill(dest: Path) -> None:
+        (dest / "README.md").write_text("no skill here\n", encoding="utf-8")
+
+    _stub_git_clone(monkeypatch, populate_no_skill)
+    _use_handler(monkeypatch, _typed_skill_handler("claude_skill", repo=_SKILL_REPO_URL))
+    result = CliRunner().invoke(
+        commands.install, ["demo", "--target", "claude-code", "--token", "t"]
+    )
+    assert result.exit_code == 1
+    assert "SKILL.md" in _combined(result)
+    assert not (home / ".claude" / "skills" / "demo-skill").exists()
+
+
+def test_install_claude_skill_honours_badge_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    _use_handler(
+        monkeypatch,
+        _typed_skill_handler("claude_skill", badge="Unsafe", repo=_SKILL_REPO_URL),
+    )
+    result = CliRunner().invoke(
+        commands.install, ["demo", "--target", "claude-code", "--token", "t"]
+    )
+    assert result.exit_code == 1
+    assert "Unsafe badge" in _combined(result)
+    assert not (home / ".claude").exists()
+
+
+def test_install_gemini_extension_placeholder_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    config = tmp_path / "mcp.json"
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "gemini", config)
+    _use_handler(monkeypatch, _typed_skill_handler("gemini_extension"))
+    result = CliRunner().invoke(
+        commands.install, ["demo", "--target", "gemini", "--token", "t"]
+    )
+    assert result.exit_code == 0, _combined(result)
+    assert "install path pending Google runtime API" in _combined(result)
+    assert not config.exists()  # nothing written anywhere
+    assert not (home / ".claude").exists()
