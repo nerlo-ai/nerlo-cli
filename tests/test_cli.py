@@ -385,3 +385,90 @@ def test_telemetry_failure_does_not_break_install(
     # Telemetry blew up but the install itself succeeded.
     assert result.exit_code == 0, _combined(result)
     assert config.exists()
+
+
+# --------------------------------------------------------------------------- #
+# type-aware submit + install (Ticket 33.9)                                   #
+# --------------------------------------------------------------------------- #
+
+
+def _capture_submit_body(captured: dict[str, Any]) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/api/v1/servers":
+            captured["body"] = json.loads(request.content)
+            return _json_response(request, 201, {"mcp_server_id": "s1", "scan_job_id": "j1"})
+        return _json_response(request, 404, {})
+
+    return handler
+
+
+def test_submit_passes_artifact_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    _use_handler(monkeypatch, _capture_submit_body(captured))
+    result = CliRunner().invoke(
+        commands.submit,
+        ["https://github.com/o/r", "--type", "claude_skill", "--token", "t"],
+    )
+    assert result.exit_code == 0, _combined(result)
+    assert captured["body"]["artifact_type"] == "claude_skill"
+    assert captured["body"]["repository_url"] == "https://github.com/o/r"
+
+
+def test_submit_without_type_omits_artifact_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    _use_handler(monkeypatch, _capture_submit_body(captured))
+    result = CliRunner().invoke(commands.submit, ["https://github.com/o/r", "--token", "t"])
+    assert result.exit_code == 0, _combined(result)
+    assert "artifact_type" not in captured["body"]
+
+
+def test_submit_rejects_unknown_type() -> None:
+    # click.Choice rejects an unknown --type with a usage error (exit 2).
+    result = CliRunner().invoke(
+        commands.submit, ["https://github.com/o/r", "--type", "bogus", "--token", "t"]
+    )
+    assert result.exit_code == 2
+    assert "bogus" in _combined(result)
+
+
+def _typed_skill_handler(artifact_type: str | None) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/api/v1/skills/"):
+            body: dict[str, Any] = {
+                "skill_id": "demo-skill",
+                "name": "demo",
+                "current_badge": "Verified",
+                "repository_url": "https://www.npmjs.com/package/demo",
+            }
+            if artifact_type is not None:
+                body["artifact_type"] = artifact_type
+            return _json_response(request, 200, body)
+        return _json_response(request, 404, {})
+
+    return handler
+
+
+def test_install_refuses_non_mcp_artifact_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = tmp_path / "mcp.json"
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
+    _use_handler(monkeypatch, _typed_skill_handler("claude_skill"))
+    result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    assert result.exit_code == 1
+    assert "claude_skill" in _combined(result)
+    assert not config.exists()  # nothing written for an unsupported type
+
+
+def test_install_allows_mcp_server_artifact_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    posts: list[httpx.Request] = []
+    monkeypatch.setattr(commands, "_telemetry_client", _recording_telemetry_client(posts))
+    config = tmp_path / "mcp.json"
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
+    _use_handler(monkeypatch, _typed_skill_handler("mcp_server"))
+    result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    assert result.exit_code == 0, _combined(result)
+    written = json.loads(config.read_text(encoding="utf-8"))
+    assert "demo-skill" in written["mcpServers"]

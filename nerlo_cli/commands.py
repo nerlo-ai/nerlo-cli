@@ -41,6 +41,16 @@ HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 # the timeout short and swallow every failure.
 TELEMETRY_TIMEOUT = httpx.Timeout(3.0, connect=2.0)
 
+# Artifact types the backend recognises (Ticket 33.9). `nerlo install` only has
+# a defined local install action for `mcp_server` (writing an mcpServers config
+# entry); the others land in platform-specific locations this thin client does
+# not manage yet, so it refuses rather than guessing a path.
+SUBMIT_ARTIFACT_TYPES = ("mcp_server", "claude_skill", "gemini_extension", "cursor_rule")
+# TODO(nerlo): teach `install` to place claude_skill (skills dir),
+# gemini_extension (extensions), and cursor_rule (rules dir) artifacts once
+# those install paths are specified; until then only mcp_server is installable.
+MCP_INSTALLABLE_ARTIFACT_TYPES = frozenset({"mcp_server"})
+
 # Req 11.1 target platforms -> local MCP config file (entries land under
 # the file's "mcpServers" object in every case).
 TARGET_CONFIG_PATHS: dict[str, Path] = {
@@ -416,6 +426,19 @@ def install(
     with _client(api_url, auth) as client:
         skill = _resolve_skill(client, skill_name)
 
+    # Ticket 33.9: type-aware install. Only `mcp_server` artifacts have a
+    # defined local install action here (writing an mcpServers entry). For any
+    # other classified type, refuse with a clear message rather than guessing a
+    # path (a skills/extension/rules artifact is NOT an mcpServers entry).
+    artifact_type = skill.get("artifact_type")
+    if artifact_type is not None and artifact_type not in MCP_INSTALLABLE_ARTIFACT_TYPES:
+        _fail(
+            f"{skill_name!r} is a {artifact_type!r} artifact — `nerlo install` "
+            "can only write MCP server config entries so far. Install it "
+            "manually per your platform's docs (install support for "
+            f"{artifact_type} is planned)."
+        )
+
     badge = skill.get("current_badge")
     # Req 11.2 badge gate.
     if badge == "Unsafe":
@@ -521,17 +544,31 @@ def _write_mcp_entry(
 
 @click.command()
 @click.argument("url")
+@click.option(
+    "--type",
+    "artifact_type",
+    type=click.Choice(SUBMIT_ARTIFACT_TYPES),
+    default=None,
+    help="Artifact type. Omit to let the server infer it.",
+)
 @_api_url_option
 @_token_option
 @_json_option
-def submit(url: str, api_url: str, token: str | None, as_json: bool) -> None:
+def submit(
+    url: str, artifact_type: str | None, api_url: str, token: str | None, as_json: bool
+) -> None:
     """Submit a repository URL for ingestion + scanning (authenticated)."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         _fail(f"malformed repository URL: {url!r} (Req 11.12)")
     auth = _require_token(token)
+    body: dict[str, Any] = {"repository_url": url}
+    # Ticket 33.9: only send artifact_type when the caller set --type; omitting
+    # it preserves the existing server-side inference behaviour.
+    if artifact_type is not None:
+        body["artifact_type"] = artifact_type
     with _client(api_url, auth) as client:
-        response = _request(client, "POST", "/api/v1/servers", json={"repository_url": url})
+        response = _request(client, "POST", "/api/v1/servers", json=body)
     if response.status_code not in (200, 201, 202):
         logger.debug("cli.submit_error_body", body=response.text[:1000])
         _fail(f"submit failed (HTTP {response.status_code})")
