@@ -16,11 +16,13 @@ command wiring — Nerlo verifies code, it does not (yet) ship a package runtime
 """
 
 import contextlib
+import hashlib
 import json
 import os
 import sys
 import tempfile
 import uuid as uuid_mod
+from importlib import metadata
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -35,6 +37,9 @@ logger = get_logger(__name__)
 DEFAULT_API_BASE_URL = "https://api.nerlo.ai"
 SEARCH_LIMIT = 50  # Req 11.3
 HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+# Telemetry (Ticket 30.5) is best-effort and must never delay an install — keep
+# the timeout short and swallow every failure.
+TELEMETRY_TIMEOUT = httpx.Timeout(3.0, connect=2.0)
 
 # Req 11.1 target platforms -> local MCP config file (entries land under
 # the file's "mcpServers" object in every case).
@@ -242,6 +247,141 @@ def _resolve_server_id(client: httpx.Client, skill_name: str, skill: dict[str, A
 
 
 # --------------------------------------------------------------------- #
+# install telemetry (Ticket 30.5)                                          #
+# --------------------------------------------------------------------- #
+
+
+def _nerlo_home() -> Path:
+    """Per-user Nerlo state dir. `NERLO_HOME` overrides it (used by tests)."""
+    override = os.environ.get("NERLO_HOME")
+    return Path(override) if override else Path.home() / ".nerlo"
+
+
+def _read_config() -> dict[str, str]:
+    """Parse ~/.nerlo/config — simple `key=value` lines, `#` comments ignored.
+
+    This is the CLI's only persisted settings store; there is no other, so
+    telemetry opt-out (`telemetry=false`) lives here.
+    """
+    path = _nerlo_home() / "config"
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _telemetry_enabled() -> bool:
+    """Honour both `NERLO_TELEMETRY=0` (env) and `telemetry=false` (config)."""
+    if os.environ.get("NERLO_TELEMETRY") == "0":
+        return False
+    value = _read_config().get("telemetry")
+    if value is not None and value.strip().lower() in ("false", "0", "no", "off"):
+        return False
+    return True
+
+
+def _anonymous_installer_id() -> str:
+    """Stable anonymous installer id from ~/.nerlo/installer-id (uuid4, 0600).
+
+    Created on first use and reused thereafter, so the derived hash is stable
+    across runs for the same machine/user.
+    """
+    path = _nerlo_home() / "installer-id"
+    with contextlib.suppress(OSError):
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    installer_id = str(uuid_mod.uuid4())
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Create 0600 from the start (don't briefly expose the id world-readable).
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(installer_id + "\n")
+        os.chmod(path, 0o600)
+    return installer_id
+
+
+def _installer_token_hash(token: str | None) -> str:
+    """SHA-256 hex of the installer identity (64 lowercase hex chars).
+
+    Identity is the authenticated credential when logged in, else the anonymous
+    installer id. The hash is one-way and stable across runs for the same
+    installer.
+    """
+    # TODO(nerlo): the CLI has no user-id lookup, so we hash the bearer token as
+    # a stand-in for the authenticated user id. Swap to the real user id if the
+    # API grows a `/me` endpoint. The hash is one-way, so the token never leaves
+    # the machine in a recoverable form.
+    identity = token if token else _anonymous_installer_id()
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _cli_version() -> str:
+    """This CLI's version string, clamped to the contract's 1–50 chars."""
+    try:
+        version = metadata.version("nerlo")
+    except metadata.PackageNotFoundError:
+        version = "0.0.0+unknown"
+    return (version[:50] or "0.0.0+unknown")
+
+
+def _telemetry_client(api_url: str) -> httpx.Client:
+    """Unauthenticated client for the telemetry POST (no Bearer token sent)."""
+    return httpx.Client(
+        base_url=api_url,
+        headers={"User-Agent": "nerlo-cli"},
+        timeout=TELEMETRY_TIMEOUT,
+    )
+
+
+def _maybe_print_telemetry_notice() -> None:
+    """One-time notice that telemetry is on and how to opt out."""
+    marker = _nerlo_home() / "telemetry-notice-shown"
+    if marker.exists():
+        return
+    click.secho(
+        "note: nerlo sends anonymous install telemetry. Opt out with "
+        "NERLO_TELEMETRY=0 or `telemetry=false` in ~/.nerlo/config.",
+        fg="yellow",
+        err=True,
+    )
+    with contextlib.suppress(OSError):
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("1\n", encoding="utf-8")
+
+
+def _emit_install_event(api_url: str, target: str, token: str | None) -> None:
+    """Best-effort install telemetry (Ticket 30.5).
+
+    POSTs to the unauthenticated `/api/v1/installations`. Every failure is
+    swallowed and logged at debug — telemetry must never fail or delay install.
+    """
+    try:
+        if not _telemetry_enabled():
+            return
+        _maybe_print_telemetry_notice()
+        body = {
+            "installer_token_hash": _installer_token_hash(token),
+            "target_platform": target,
+            "cli_version": _cli_version(),
+        }
+        with _telemetry_client(api_url) as client:
+            client.post("/api/v1/installations", json=body)
+        logger.debug("cli.install", telemetry="sent", target=target)
+    except Exception as exc:  # noqa: BLE001 — best-effort, never break install
+        logger.debug("cli.install", telemetry="failed", error=type(exc).__name__)
+
+
+# --------------------------------------------------------------------- #
 # nerlo install (Req 11.1, 11.2)                                           #
 # --------------------------------------------------------------------- #
 
@@ -303,6 +443,8 @@ def install(
         badge=badge,
         config_path=str(config_path),
     )
+    # Ticket 30.5: best-effort install telemetry — never raises, never delays.
+    _emit_install_event(api_url, target, token)
     if as_json:
         _echo_json(
             {

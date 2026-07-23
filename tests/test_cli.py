@@ -19,7 +19,9 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,24 @@ from click.testing import CliRunner, Result
 from nerlo_cli import commands
 
 Handler = Callable[[httpx.Request], httpx.Response]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_telemetry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep telemetry (Ticket 30.5) off the real network and out of ~/.nerlo.
+
+    Every test gets an isolated `NERLO_HOME` so installer-id / notice markers
+    never touch the developer's home, and the telemetry client defaults to
+    raising so no test can accidentally make a real POST. Tests that assert on
+    telemetry override `_telemetry_client` after this runs.
+    """
+    monkeypatch.setenv("NERLO_HOME", str(tmp_path / ".nerlo"))
+    monkeypatch.delenv("NERLO_TELEMETRY", raising=False)
+
+    def _no_network(api_url: str) -> httpx.Client:
+        raise RuntimeError("telemetry client not stubbed for this test")
+
+    monkeypatch.setattr(commands, "_telemetry_client", _no_network)
 
 
 def _use_handler(monkeypatch: pytest.MonkeyPatch, handler: Handler) -> None:
@@ -237,3 +257,131 @@ def test_api_401_aborts_with_no_action(monkeypatch: pytest.MonkeyPatch) -> None:
     result = CliRunner().invoke(commands.search, ["alpha"])
     assert result.exit_code == 1
     assert "authentication failed" in _combined(result)
+
+
+# --------------------------------------------------------------------------- #
+# install telemetry (Ticket 30.5)                                             #
+# --------------------------------------------------------------------------- #
+
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _recording_telemetry_client(posts: list[httpx.Request]) -> Callable[[str], httpx.Client]:
+    """A `_telemetry_client` replacement that records every request it sends."""
+
+    def factory(api_url: str) -> httpx.Client:
+        def handler(request: httpx.Request) -> httpx.Response:
+            posts.append(request)
+            return httpx.Response(202, json={}, request=request)
+
+        return httpx.Client(base_url=api_url, transport=httpx.MockTransport(handler))
+
+    return factory
+
+
+def test_installer_token_hash_is_stable_and_hex(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NERLO_HOME", str(tmp_path / ".nerlo"))
+    # Anonymous path: stable across calls (installer-id persisted) and 64 hex.
+    first = commands._installer_token_hash(None)
+    second = commands._installer_token_hash(None)
+    assert first == second
+    assert _HEX64.match(first)
+    # installer-id file is created 0600.
+    id_path = tmp_path / ".nerlo" / "installer-id"
+    assert id_path.exists()
+    assert (id_path.stat().st_mode & 0o777) == 0o600
+    # Token path: deterministic SHA-256 hex of the credential, 64 hex chars.
+    token_hash = commands._installer_token_hash("tok")
+    assert token_hash == hashlib.sha256(b"tok").hexdigest()
+    assert _HEX64.match(token_hash)
+
+
+def test_install_emits_telemetry_with_expected_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    posts: list[httpx.Request] = []
+    monkeypatch.setattr(commands, "_telemetry_client", _recording_telemetry_client(posts))
+    config = tmp_path / "mcp.json"
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
+    _use_handler(monkeypatch, _skill_handler("Verified"))
+    result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    assert result.exit_code == 0, _combined(result)
+    assert len(posts) == 1
+    request = posts[0]
+    assert request.url.path == "/api/v1/installations"
+    # Unauthenticated endpoint: the bearer token must not be sent.
+    assert "authorization" not in {k.lower() for k in request.headers}
+    body = json.loads(request.content)
+    assert body["target_platform"] == "mcp"
+    assert _HEX64.match(body["installer_token_hash"])
+    assert 1 <= len(body["cli_version"]) <= 50
+
+
+def test_install_prints_telemetry_notice_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    posts: list[httpx.Request] = []
+    monkeypatch.setattr(commands, "_telemetry_client", _recording_telemetry_client(posts))
+    config = tmp_path / "mcp.json"
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
+    _use_handler(monkeypatch, _skill_handler("Verified"))
+    first = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    assert first.exit_code == 0, _combined(first)
+    assert "anonymous install telemetry" in _combined(first)
+    second = CliRunner().invoke(
+        commands.install, ["demo", "--target", "mcp", "--token", "t", "--force"]
+    )
+    assert second.exit_code == 0, _combined(second)
+    # Notice is one-time: it should not repeat on the second install.
+    assert "anonymous install telemetry" not in _combined(second)
+
+
+def test_telemetry_env_opt_out_suppresses_post(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NERLO_TELEMETRY", "0")
+    posts: list[httpx.Request] = []
+    monkeypatch.setattr(commands, "_telemetry_client", _recording_telemetry_client(posts))
+    config = tmp_path / "mcp.json"
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
+    _use_handler(monkeypatch, _skill_handler("Verified"))
+    result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    assert result.exit_code == 0, _combined(result)
+    assert config.exists()  # install still happened
+    assert posts == []  # opt-out -> no telemetry POST, no notice
+    assert "anonymous install telemetry" not in _combined(result)
+
+
+def test_telemetry_config_opt_out_suppresses_post(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    nerlo_home = tmp_path / ".nerlo"
+    nerlo_home.mkdir(parents=True)
+    (nerlo_home / "config").write_text("telemetry=false\n", encoding="utf-8")
+    monkeypatch.setenv("NERLO_HOME", str(nerlo_home))
+    posts: list[httpx.Request] = []
+    monkeypatch.setattr(commands, "_telemetry_client", _recording_telemetry_client(posts))
+    config = tmp_path / "mcp.json"
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
+    _use_handler(monkeypatch, _skill_handler("Verified"))
+    result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    assert result.exit_code == 0, _combined(result)
+    assert posts == []
+
+
+def test_telemetry_failure_does_not_break_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def boom(api_url: str) -> httpx.Client:
+        raise RuntimeError("network is down")
+
+    monkeypatch.setattr(commands, "_telemetry_client", boom)
+    config = tmp_path / "mcp.json"
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
+    _use_handler(monkeypatch, _skill_handler("Verified"))
+    result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    # Telemetry blew up but the install itself succeeded.
+    assert result.exit_code == 0, _combined(result)
+    assert config.exists()
