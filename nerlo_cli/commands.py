@@ -656,8 +656,14 @@ def _git_shallow_clone(repo_url: str, dest: Path) -> None:
         _fail(f"cannot clone {repo_url!r} — only http(s) repository URLs are supported")
     try:
         # Fixed argv (no shell); `--` stops a URL from being parsed as an option.
+        # `-c core.symlinks=false`: an untrusted skill repo must never check out
+        # a committed symlink as a real link — otherwise a `x -> ~/.ssh/id_rsa`
+        # (or `-> /`) would be dereferenced when the skill dir is copied into
+        # ~/.claude/skills/, copying an outside file's content into the install
+        # (and rglob could traverse a dir symlink out of the clone). With this,
+        # git writes each symlink as a plain placeholder file — inert.
         completed = subprocess.run(
-            ["git", "clone", "--depth", "1", "--", repo_url, str(dest)],
+            ["git", "-c", "core.symlinks=false", "clone", "--depth", "1", "--", repo_url, str(dest)],
             capture_output=True,
             text=True,
             timeout=GIT_CLONE_TIMEOUT_SECONDS,
@@ -738,7 +744,12 @@ def _install_claude_skill(skill: dict[str, Any], slug: str, *, force: bool) -> P
         )
         try:
             staged = staging / slug
-            shutil.copytree(skill_dir, staged, ignore=shutil.ignore_patterns(".git"))
+            # symlinks=True PRESERVES any symlink as a link instead of
+            # dereferencing it (defense in depth behind core.symlinks=false on
+            # the clone): the install never READS an out-of-tree file's content.
+            shutil.copytree(
+                skill_dir, staged, symlinks=True, ignore=shutil.ignore_patterns(".git")
+            )
             if dest.exists():  # only reachable with --force
                 shutil.rmtree(dest)
             os.replace(staged, dest)

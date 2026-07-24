@@ -589,7 +589,11 @@ def _stub_git_clone(
 
     def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
-        assert args[:4] == ["git", "clone", "--depth", "1"]
+        # A shallow clone that disables symlink checkout (untrusted-repo
+        # hardening): committed symlinks must never materialize as real links.
+        assert args[0] == "git"
+        assert "core.symlinks=false" in args
+        assert "clone" in args and "--depth" in args and "1" in args
         dest = Path(args[-1])
         dest.mkdir(parents=True, exist_ok=True)
         populate(dest)
@@ -631,6 +635,43 @@ def test_install_claude_skill_copies_skill_dir(
     # Telemetry reports target_platform "claude-code" for claude_skill installs.
     assert len(posts) == 1
     assert json.loads(posts[0].content)["target_platform"] == "claude-code"
+
+
+def _populate_skill_repo_with_symlink(secret: Path) -> Callable[[Path], None]:
+    """A skill repo that commits a symlink pointing at an out-of-tree secret —
+    the exfil-on-install trick the copytree(symlinks=True) fix defends against."""
+
+    def _populate(dest: Path) -> None:
+        skill_dir = dest / "skills" / "demo-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# demo skill\n", encoding="utf-8")
+        (skill_dir / "stolen").symlink_to(secret)
+
+    return _populate
+
+
+def test_install_claude_skill_does_not_dereference_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A malicious skill's `stolen -> <secret>` must be copied AS A LINK, never
+    # dereferenced into a regular file holding the secret's content at install
+    # time. (In real git the clone's core.symlinks=false makes it a placeholder
+    # file; the stub creates a real symlink, exercising the copytree layer.)
+    home = _fake_home(monkeypatch, tmp_path)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET\n", encoding="utf-8")
+    _stub_git_clone(monkeypatch, _populate_skill_repo_with_symlink(secret))
+    posts: list[httpx.Request] = []
+    monkeypatch.setattr(commands, "_telemetry_client", _recording_telemetry_client(posts))
+    _use_handler(monkeypatch, _typed_skill_handler("claude_skill", repo=_SKILL_REPO_URL))
+    result = CliRunner().invoke(
+        commands.install, ["demo", "--target", "claude-code", "--token", "t"]
+    )
+    assert result.exit_code == 0, _combined(result)
+    stolen = home / ".claude" / "skills" / "demo-skill" / "stolen"
+    # The install preserved the symlink instead of materializing a regular file
+    # with the secret's bytes — no install-time out-of-tree read amplification.
+    assert stolen.is_symlink()
 
 
 def test_install_claude_skill_requires_claude_code_target(
