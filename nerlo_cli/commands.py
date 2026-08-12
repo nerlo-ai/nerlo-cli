@@ -1477,6 +1477,36 @@ def _resolve_one(
     detail_cache: dict[str, dict[str, Any]],
 ) -> _Checked:
     """Resolve one discovered artifact against the registry."""
+    # ZERO SEARCHABLE TERMS IS "WE NEVER ASKED", NOT "WE ASKED AND IT IS ABSENT".
+    #
+    # `_search_terms` drops candidates under the registry's 2-character `q=`
+    # floor. An artifact whose every candidate identity is 1 character — an
+    # mcpServers key of "a" with a command we cannot derive a package from —
+    # therefore arrives here with `terms == ()`. The loop below would not
+    # execute, `unread` would stay empty, and the function would fall through to
+    # STATUS_UNKNOWN: "not in the registry listing". That is a claim about a
+    # search that was never issued (proved with a recording transport:
+    # QUERIES ISSUED: []), and STATUS_UNKNOWN does not fail the gate at
+    # `--fail-on unsafe`, so the artifact passes.
+    #
+    # This is the SAME defect as the pagination one below, reached through the
+    # term-length gate instead — the third distinct route to "could not
+    # determine" being rendered as "fine" in this one function. Both now land on
+    # STATUS_UNRESOLVED, which is in INCOMPLETE_STATUSES and in no FAIL_ON set,
+    # so it exits 3 and is never a pass and never a verdict.
+    #
+    # It also keeps two shipped claims true: the README's definition of UNKNOWN
+    # as "searched the registry listing to exhaustion and did not find it"
+    # (`grep -n 'to exhaustion' README.md`) and this module's "could not
+    # determine is never a pass, at any --fail-on level".
+    if not found.terms:
+        return _Checked(
+            found=found,
+            status=STATUS_UNRESOLVED,
+            note="no searchable identity: every candidate name is under the registry's "
+            "2-character query minimum, so no search was issued",
+        )
+
     matches: list[dict[str, Any]] = []
     unread: list[str] = []
     try:

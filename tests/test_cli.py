@@ -1469,6 +1469,38 @@ def test_check_issues_the_package_name_as_a_query_not_just_as_a_matcher(
     assert issued[0] == "@abhiz123/todoist-mcp-server"  # first, before the key
 
 
+def test_an_unsearchable_name_is_unresolved_not_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # THE THIRD ROUTE to "could not determine" being rendered as a pass, found
+    # by adversarial review after the other two were closed.
+    #
+    # `_search_terms` drops candidates under the registry's 2-character `q=`
+    # floor. A server keyed "a" whose command yields no package name therefore
+    # reaches `_resolve_one` with terms == (), the search loop never runs, and
+    # the fall-through reported STATUS_UNKNOWN "not in the registry listing" —
+    # a claim about a search that was never issued — which does not fail
+    # `--fail-on unsafe`, so it exited 0.
+    #
+    # THE QUERY ASSERTION IS THE POINT. Asserting only the status would pass
+    # against an implementation that searched and legitimately found nothing;
+    # `issued == []` is what pins "we never asked".
+    root = _project(tmp_path, {"a": {"command": "node", "args": ["server.js"]}})
+    queries: list[httpx.URL] = []
+    _use_handler(monkeypatch, _registry_handler([_row("a", "Unsafe")], queries=queries))
+    result = CliRunner().invoke(commands.check, [str(root)])
+
+    issued = [q.params.get("q") for q in queries]
+    assert issued == [], f"expected no query to be issuable, got {issued}"
+    assert result.exit_code == commands.EXIT_INCOMPLETE
+    assert "UNRESOLVED" in result.output
+    assert "not in the registry listing" not in result.output
+    # And it must never be a pass at ANY level — the invariant the status exists for.
+    for level in ("unsafe", "caution", "any"):
+        r = CliRunner().invoke(commands.check, [str(root), "--fail-on", level])
+        assert r.exit_code != 0, f"--fail-on {level} passed an artifact it never searched for"
+
+
 def test_fail_on_ladder_is_monotonic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Mutation survivor: narrowing FAIL_ON_STATUSES["caution"] to drop
     # STATUS_UNSAFE left all 62 tests green — nothing asserted that a laxer
