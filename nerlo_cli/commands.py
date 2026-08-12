@@ -1,4 +1,4 @@
-"""Nerlo registry CLI commands — search, info, install, submit, rescan.
+"""Nerlo registry CLI commands — search, info, install, submit, rescan, check.
 
 Every command talks HTTP to the public Nerlo registry API (`NERLO_API_BASE_URL`,
 default https://api.nerlo.ai); write operations (`submit`, `rescan`)
@@ -19,6 +19,16 @@ refuses. For npm-hosted packages the mcpServers entry is runnable
 (`npx -y <package>`); for other sources the entry records the repository and
 the user finishes the command wiring — Nerlo verifies code, it does not (yet)
 ship a package runtime.
+
+`check` is the CI gate and runs the same map in reverse: it READS the platform
+configs `install` WRITES, resolves each entry against the public
+(unauthenticated) registry, and exits non-zero on policy violation. Its exit
+code is its product — see the `nerlo check` section for the contract, and for
+why a listing miss is reported as its own outcome rather than as a pass.
+
+The governing invariant of `check`, which every status and exit code below
+serves: AN UNRESOLVED ARTIFACT MUST NEVER BE INDISTINGUISHABLE FROM AN ABSENT
+ONE, and neither may pass a gate whose whole purpose is to fail on Unsafe.
 """
 
 import contextlib
@@ -31,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import uuid as uuid_mod
+from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 from typing import Any, cast
@@ -69,11 +80,36 @@ _SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Req 11.1 target platforms -> local MCP config file (entries land under
 # the file's "mcpServers" object in every case).
+#
+# ONE table, two directions. `install` WRITES the path built here; `check`
+# READS the same relative parts, re-rooted at a project directory when the user
+# passes one. Keeping the relative parts in a single place is what stops the
+# reader from parsing a layout the writer no longer produces.
+#   platform -> (path parts relative to its root, which root the writer uses)
+PLATFORM_CONFIG_LAYOUT: dict[str, tuple[tuple[str, ...], str]] = {
+    "claude-code": ((".claude.json",), "home"),
+    "cursor": ((".cursor", "mcp.json"), "home"),
+    "gemini": ((".gemini", "settings.json"), "home"),
+    "mcp": (("mcp.json",), "cwd"),
+}
+# Discovery-only extras (`check` reads them; `install` never writes them). A
+# repo checked out in CI commonly carries Claude Code's project-scoped
+# `.mcp.json`; a gate that cannot see it is a gate with a hole, and reading a
+# file that does not exist costs nothing. Writers deliberately still emit
+# `mcp.json` — this list only widens what the reader looks at.
+PROJECT_CONFIG_EXTRAS: tuple[tuple[str, tuple[str, ...]], ...] = (("mcp", (".mcp.json",)),)
+# Claude Code's per-user skills directory, relative to its root. Shared by the
+# claude_skill installer (`_claude_skills_dir`) and by `check` discovery.
+CLAUDE_SKILLS_PARTS: tuple[str, ...] = (".claude", "skills")
+
+
+def _platform_root(kind: str) -> Path:
+    return Path.home() if kind == "home" else Path.cwd()
+
+
 TARGET_CONFIG_PATHS: dict[str, Path] = {
-    "claude-code": Path.home() / ".claude.json",
-    "cursor": Path.home() / ".cursor" / "mcp.json",
-    "gemini": Path.home() / ".gemini" / "settings.json",
-    "mcp": Path.cwd() / "mcp.json",
+    name: _platform_root(root).joinpath(*parts)
+    for name, (parts, root) in PLATFORM_CONFIG_LAYOUT.items()
 }
 
 _api_url_option = click.option(
@@ -119,13 +155,36 @@ def _require_token(token: str | None) -> str:
     return token
 
 
-def _request(client: httpx.Client, method: str, path: str, **kwargs: Any) -> httpx.Response:
+class RegistryUnreachable(Exception):
+    """A registry call did not produce an answer.
+
+    `_request(..., fatal=False)` raises this instead of exiting, so a caller
+    that must distinguish "the registry says this is fine" from "the registry
+    never answered" can. `nerlo check` is that caller: collapsing an
+    unanswered request into a pass is precisely the failure the gate exists to
+    prevent.
+    """
+
+
+def _request(
+    client: httpx.Client, method: str, path: str, *, fatal: bool = True, **kwargs: Any
+) -> httpx.Response:
+    """Issue a registry request.
+
+    `fatal=True` (the default, and every pre-existing caller) keeps the
+    original behaviour: a transport error or a 401/403 prints an error and
+    exits. `fatal=False` raises `RegistryUnreachable` instead.
+    """
     try:
         response = client.request(method, path, **kwargs)
     except httpx.HTTPError as exc:
+        if not fatal:
+            raise RegistryUnreachable(type(exc).__name__) from exc
         _fail(f"cannot reach registry API: {type(exc).__name__}")
         raise AssertionError from exc  # unreachable; _fail exits
     if response.status_code in (401, 403):
+        if not fatal:
+            raise RegistryUnreachable(f"HTTP {response.status_code}")
         _fail(f"authentication failed (HTTP {response.status_code}) — no action taken")
     return response
 
@@ -640,7 +699,7 @@ def _claude_skills_dir() -> Path:
     Plain `Path.home()` — the CLI has no env override pattern for `~/.claude`
     (`NERLO_HOME` governs only `~/.nerlo`), matching TARGET_CONFIG_PATHS.
     """
-    return Path.home() / ".claude" / "skills"
+    return Path.home().joinpath(*CLAUDE_SKILLS_PARTS)
 
 
 def _git_shallow_clone(repo_url: str, dest: Path) -> None:
@@ -833,9 +892,919 @@ def rescan(identifier: str, api_url: str, token: str | None, as_json: bool) -> N
     click.echo(f"  scan job: {payload.get('scan_job_id')} ({payload.get('dispatch')})")
 
 
+# --------------------------------------------------------------------- #
+# nerlo check — the CI gate                                                #
+# --------------------------------------------------------------------- #
+#
+# `check` discovers the AI artifacts configured on this machine (or in a
+# checked-out project) by READING the same config files `install` writes, then
+# resolves each one against the public registry and EXITS NON-ZERO when policy
+# is violated. The exit code is the product: a web dashboard is visited when
+# somebody remembers, a non-zero exit blocks the merge whether anybody
+# remembered or not.
+
+# The outcomes `check` reports. These are deliberately NOT collapsible into a
+# pass/fail boolean, because three of them are different facts:
+#   verified  — in the registry, aggregate verdict Verified
+#   caution   — in the registry, aggregate verdict Caution
+#   unsafe    — in the registry, aggregate verdict Unsafe
+#   withheld  — in the registry, and the registry is REFUSING to publish an
+#               aggregate verdict (`aggregate_verdict_withheld`). Live data
+#               shows this is common; it means coverage was insufficient.
+#   unscored  — in the registry, no aggregate verdict yet (never scanned, or a
+#               badge string this CLI does not recognise)
+#   unknown   — the registry's listing was searched to exhaustion and this
+#               artifact is not in it
+#   unresolved— the registry holds MORE candidate rows than this command is
+#               willing to read, and none of the rows it did read matched. We
+#               do not know whether the artifact is listed. NOT the same fact
+#               as `unknown`, and that distinction is the whole point (see
+#               `_search_pages`).
+#   error     — could not be resolved (registry unreachable / bad response)
+#
+# `unknown` IS NOT `verified`. Rendering "nobody has ever looked at this" as a
+# green check is the exact tri-state collapse this product exists to stop — a
+# scanner that did not run must never score as a pass. Same for `withheld`,
+# `unresolved` and `error`: an absent answer is not a good answer. Every
+# non-verified status gets its own visibly distinct row, and `unknown`
+# additionally gets a submit funnel pointing at `nerlo submit`.
+#
+# Even `unknown` is stated carefully. The OpenAPI schema for the list endpoint
+# says `undistributed` artifacts "are never listed; they remain retrievable by
+# direct id", so a miss against the LISTING is "we did not find it", not proof
+# the registry has never heard of it. The output says listing, not existence.
+STATUS_VERIFIED = "verified"
+STATUS_CAUTION = "caution"
+STATUS_UNSAFE = "unsafe"
+STATUS_WITHHELD = "withheld"
+STATUS_UNSCORED = "unscored"
+STATUS_UNKNOWN = "unknown"
+STATUS_UNRESOLVED = "unresolved"
+STATUS_ERROR = "error"
+
+# Exit codes. THIS IS THE CONTRACT — CI reads it, humans read the table.
+#   0  every discovered artifact satisfied the policy (including "nothing
+#      installed", which is a legitimate pass)
+#   1  policy violated — at least one artifact is at or worse than --fail-on
+#   2  usage error (Click's own; listed here so nothing else claims it)
+#   3  incomplete — the check could not determine an answer for at least one
+#      artifact (registry unreachable, bad response, unparseable local config,
+#      or a search too broad to read to the end) and found no outright
+#      violation. A check that could not reach the registry has NOT passed.
+# Violation outranks incomplete: if we already know something is Unsafe, exit 1
+# is the more actionable signal, and the incomplete rows are still printed.
+EXIT_OK = 0
+EXIT_POLICY_VIOLATION = 1
+EXIT_INCOMPLETE = 3
+
+# --fail-on level -> the statuses that trip it.
+#
+# `unsafe` and `caution` are VERDICT thresholds: they fire on a published
+# verdict at or worse than the named level, and deliberately do NOT fire on
+# unknown/withheld/unscored. Reason, stated plainly: the registry holds a few
+# hundred artifacts and the ecosystem holds many thousands, so a default that
+# failed on unknown would red-build essentially every repo on day one, and a
+# gate that red-builds everything on day one gets deleted in week one. A
+# deleted gate protects nothing. Unknowns are instead made loud in the output
+# and funnelled to `nerlo submit`.
+#
+# `any` DOES include unknown (and withheld, and unscored). That is the whole
+# point of the strict level: it means "fail unless the registry affirmatively
+# verified this", which is the correct policy once a team has submitted its
+# dependency set and wants to keep it that way. Choosing `any` is choosing to
+# treat absence of evidence as failure — available, not default.
+#
+# THE LADDER IS MONOTONIC and `test_fail_on_ladder_is_monotonic` pins it: each
+# level is a superset of the one before, so raising --fail-on can only ever add
+# failures. Narrowing `caution` to just {caution} would let a laxer-sounding
+# level miss an Unsafe artifact that the stricter-sounding level catches, which
+# is a gate that lies about its own severity ordering.
+FAIL_ON_STATUSES: dict[str, frozenset[str]] = {
+    "unsafe": frozenset({STATUS_UNSAFE}),
+    "caution": frozenset({STATUS_UNSAFE, STATUS_CAUTION}),
+    "any": frozenset(
+        {STATUS_UNSAFE, STATUS_CAUTION, STATUS_WITHHELD, STATUS_UNSCORED, STATUS_UNKNOWN}
+    ),
+}
+# Statuses that mean "we did not get an answer", as opposed to "the answer was
+# bad". These drive EXIT_INCOMPLETE and are deliberately in NONE of the
+# FAIL_ON_STATUSES sets above: "we could not ask" is never a policy verdict —
+# and, critically, never a pass either, at any --fail-on level.
+INCOMPLETE_STATUSES: frozenset[str] = frozenset({STATUS_ERROR, STATUS_UNRESOLVED})
+
+# Command wrappers whose first non-flag argument names a package, so a
+# hand-written mcpServers entry still yields something searchable. The Nerlo
+# writer only ever emits `npx` / `uvx` (see `_build_mcp_entry`); the rest are
+# here because `check` reads configs this CLI did not write.
+_PACKAGE_RUNNERS: dict[str, frozenset[str]] = {
+    "npx": frozenset(),
+    "bunx": frozenset(),
+    "uvx": frozenset(),
+    "pnpm": frozenset({"dlx", "exec"}),
+    "uv": frozenset({"tool", "run"}),
+}
+
+
+@dataclass(frozen=True)
+class _Discovered:
+    """One locally-configured artifact, before registry resolution."""
+
+    name: str  # as configured locally (mcpServers key, or skill dir name)
+    platform: str  # which platform config it came from
+    source: str  # the file/dir on disk it was read out of
+    kind: str  # mcp_server | claude_skill
+    terms: tuple[str, ...]  # registry search terms, best first
+    names: frozenset[str]  # lowercased names that count as an exact match
+    repos: frozenset[str]  # normalised repository URLs that count as a match
+
+
+@dataclass
+class _Checked:
+    """A discovered artifact plus whatever the registry could tell us."""
+
+    found: _Discovered
+    status: str
+    badge: str | None = None
+    score: float | None = None
+    server_id: str | None = None
+    scanners: int | None = None
+    note: str = ""
+    duplicates: int = 0
+
+
+def _normalise_repo(url: str) -> str:
+    """host+path, lowercased, `.git` and trailing slash stripped.
+
+    So `https://GitHub.com/o/r.git` and `https://github.com/o/r/` compare
+    equal. Scheme is dropped; host is NOT, because the host is the part that
+    makes two URLs genuinely different projects.
+    """
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return ""
+    path = parsed.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return f"{host}{path.lower()}"
+
+
+def _package_from_command(command: str, args: Any) -> str | None:
+    """The package name a runnable mcpServers entry launches, if we can tell.
+
+    Inverse of `_build_mcp_entry`: `{"command": "npx", "args": ["-y", pkg]}`
+    -> `pkg`. Returns None for `node server.js`, `docker run ...` and anything
+    else whose first argument is not a package — guessing there would invent an
+    identity, and a wrong identity resolving to some other project's Verified
+    badge is worse than reporting the entry under its config key alone.
+    """
+    runner = Path(str(command or "")).name.lower()
+    if runner.endswith(".exe"):
+        runner = runner[:-4]
+    subcommands = _PACKAGE_RUNNERS.get(runner)
+    if subcommands is None or not isinstance(args, list):
+        return None
+    for arg in args:
+        if not isinstance(arg, str) or not arg or arg.startswith("-"):
+            continue
+        if arg in subcommands:
+            continue
+        # Strip a version pin (`pkg@1.2.3`) while preserving an npm scope
+        # (`@scope/pkg`, whose leading `@` is at index 0).
+        at = arg.find("@", 1)
+        return arg[:at] if at > 0 else arg
+    return None
+
+
+def _repo_search_terms(repo: str) -> list[str]:
+    """Search terms derived from an already-normalised repository URL.
+
+    THIS IS WHAT MAKES THE REPOSITORY MATCH ARM REACHABLE. `_match_rows` will
+    happily match a row on `repository_url`, but a row you never retrieved
+    cannot be matched — and the registry's `q=` is a keyword search over
+    name/description/author that does NOT index repository URLs. Measured
+    against the live API: `q=https://github.com/gemini-cli-extensions/alloydb`
+    -> 0 results, `q=gemini-cli-extensions/alloydb` -> 0 results,
+    `q=alloydb` -> the row. So the only way to RETRIEVE a repository-keyed
+    entry is to query the repo path's own segments.
+
+    The LAST path segment only — it is the one that names the artifact. The
+    host is dropped (`q=github.com` is noise) and so is the owner: live,
+    `q=gemini-cli-extensions` returns 0 results, so an owner query buys nothing
+    and costs a full paginated search per unmatched artifact. Returned as a
+    list so the caller splices it into the term list positionally.
+    """
+    segments = [s for s in repo.split("/")[1:] if s]
+    return segments[-1:]
+
+
+def _discovered_from_entry(name: str, entry: Any, platform: str, source: str) -> _Discovered:
+    """Build the search/match identity for one `mcpServers` entry."""
+    names = {name.strip().lower()}
+    repos: set[str] = set()
+    package: str | None = None
+    repo_terms: list[str] = []
+    if isinstance(entry, dict):
+        # `_build_mcp_entry` writes {"repository": ...} for non-package sources.
+        repo = _normalise_repo(str(entry.get("repository") or ""))
+        if repo:
+            repos.add(repo)
+            repo_terms = _repo_search_terms(repo)
+        package = _package_from_command(entry.get("command", ""), entry.get("args"))
+        if package:
+            names.add(package.lower())
+    # Priority order, best identity first: the package name is the registry's
+    # own naming for anything published to npm/PyPI; the repository path names
+    # the project itself; the config key is merely user-chosen.
+    terms = [t for t in [package, *repo_terms, name] if t]
+    return _Discovered(
+        name=name,
+        platform=platform,
+        source=source,
+        kind="mcp_server",
+        terms=_search_terms(terms),
+        names=frozenset(n for n in names if n),
+        repos=frozenset(repos),
+    )
+
+
+# Queries issued per artifact. Three, not two: package name, repository path
+# segment, config key. The middle one is what resurrected the repository-match
+# path (see `_repo_search_terms`), and searching stops at the first term that
+# yields an exact match, so the common case is still one query.
+_MAX_SEARCH_TERMS = 3
+
+
+def _search_terms(candidates: list[str]) -> tuple[str, ...]:
+    """Dedupe, clamp to the API's 2-100 char query window, cap the count."""
+    out: list[str] = []
+    for candidate in candidates:
+        term = candidate.strip()[:100]
+        if len(term) >= 2 and term not in out:
+            out.append(term)
+    return tuple(out[:_MAX_SEARCH_TERMS])
+
+
+def _mcp_servers_object(container: dict[str, Any], where: str) -> dict[str, Any]:
+    """The `mcpServers` object out of one JSON container, or `{}` if absent.
+
+    A present-but-wrong-shaped `mcpServers` raises rather than reading as
+    empty: it may well be hiding entries, and an unread entry must never look
+    like an absent one.
+    """
+    servers = container.get("mcpServers")
+    if servers is None:
+        return {}
+    if not isinstance(servers, dict):
+        raise ValueError(f"mcpServers is not a JSON object ({where})")
+    return cast(dict[str, Any], servers)
+
+
+def _read_mcp_servers(config_path: Path) -> list[tuple[str, str, Any]]:
+    """Every configured MCP server in a platform config, as (source, name, entry).
+
+    TWO shapes, both real, and reading only the first is how a default-mode
+    `nerlo check` misses most Claude Code installs:
+
+      1. the TOP-LEVEL `mcpServers` object — what `nerlo install` writes and
+         what every platform documents; and
+      2. `projects.<absolute-path>.mcpServers` — Claude Code ALSO nests
+         per-project servers under a `projects` map in `~/.claude.json`, and on
+         a working developer machine that is where most entries actually live.
+         Verified against a real `~/.claude.json` carrying a 10-entry
+         `projects` map.
+
+    Returned as a LIST of triples rather than merged into one dict on purpose:
+    two projects may each configure a server called `github`, and a dict keyed
+    by name would silently drop one of them — the same "unchecked looks like
+    absent" collapse this command exists to stop. The `source` string carries
+    the owning project path so the table can say which config an entry came
+    from.
+
+    Raises OSError/ValueError to the caller: a config we could not parse must
+    surface as `incomplete`, never as "no artifacts configured here".
+    """
+    loaded: object = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError("config root is not a JSON object")
+    root = cast(dict[str, Any], loaded)
+    source = str(config_path)
+    entries: list[tuple[str, str, Any]] = [
+        (source, str(name), entry) for name, entry in _mcp_servers_object(root, source).items()
+    ]
+
+    projects = root.get("projects")
+    if projects is None:
+        return entries
+    if not isinstance(projects, dict):
+        raise ValueError("projects is not a JSON object")
+    for project_path, project in sorted(cast(dict[str, Any], projects).items()):
+        # A non-object project value cannot be hiding an `mcpServers` key, so
+        # skipping it hides nothing — this is not the "read it as empty" case
+        # `_mcp_servers_object` refuses.
+        if not isinstance(project, dict):
+            continue
+        nested = f"{source}#projects[{project_path}]"
+        entries.extend(
+            (nested, str(name), entry)
+            for name, entry in _mcp_servers_object(cast(dict[str, Any], project), nested).items()
+        )
+    return entries
+
+
+def _discover_claude_skills(skills_root: Path) -> list[_Discovered]:
+    """Skill directories installed under a `.claude/skills` root.
+
+    Mirrors `_install_claude_skill`, which copies a directory containing
+    SKILL.md to `<skills_root>/<slug>/`. Dot-prefixed names are skipped, which
+    also skips that installer's `.<slug>.*.nerlo-tmp` staging directories.
+    """
+    if not skills_root.is_dir():
+        return []
+    found: list[_Discovered] = []
+    for child in sorted(skills_root.iterdir()):
+        if child.name.startswith(".") or not (child / "SKILL.md").is_file():
+            continue
+        found.append(
+            _Discovered(
+                name=child.name,
+                platform="claude-code",
+                source=str(child),
+                kind="claude_skill",
+                terms=_search_terms([child.name]),
+                names=frozenset({child.name.lower()}),
+                repos=frozenset(),
+            )
+        )
+    return found
+
+
+def _discover(project: Path | None) -> tuple[list[_Discovered], list[str]]:
+    """Find locally-configured artifacts. Returns (artifacts, unreadable).
+
+    `project is None` scans the standard per-user locations (TARGET_CONFIG_PATHS
+    plus `~/.claude/skills`). An explicit PATH scans a PROJECT instead: the same
+    relative layouts rooted at that directory, and NOT the home locations.
+    That split is the CI use case — a workflow runs inside a checkout where
+    $HOME belongs to an ephemeral runner, so mixing runner-global config into a
+    repo's gate would make the gate's result depend on the machine rather than
+    on the repo.
+    """
+    sources: list[tuple[str, Path]] = []
+    skills_roots: list[Path] = []
+    if project is None:
+        sources = sorted(TARGET_CONFIG_PATHS.items())
+        skills_roots = [_claude_skills_dir()]
+    elif project.is_file():
+        # An explicit file is read as a platform config directly, so
+        # `nerlo check .cursor/mcp.json` works without a directory dance.
+        sources = [("mcp", project)]
+    else:
+        seen: set[Path] = set()
+        for name, (parts, _root) in sorted(PLATFORM_CONFIG_LAYOUT.items()):
+            sources.append((name, project.joinpath(*parts)))
+            seen.add(project.joinpath(*parts))
+        for name, parts in PROJECT_CONFIG_EXTRAS:
+            path = project.joinpath(*parts)
+            if path not in seen:
+                sources.append((name, path))
+        skills_roots = [project.joinpath(*CLAUDE_SKILLS_PARTS)]
+
+    artifacts: list[_Discovered] = []
+    unreadable: list[str] = []
+    for platform, config_path in sources:
+        if not config_path.is_file():
+            continue
+        try:
+            servers = _read_mcp_servers(config_path)
+        except (OSError, ValueError) as exc:
+            # NOT silently empty: an unparseable config is an unchecked config.
+            unreadable.append(f"{config_path}: {type(exc).__name__}")
+            continue
+        for source, name, entry in servers:
+            artifacts.append(_discovered_from_entry(name, entry, platform, source))
+    for skills_root in skills_roots:
+        artifacts.extend(_discover_claude_skills(skills_root))
+    return artifacts, unreadable
+
+
+# Rank used ONLY to pick which row wins when the registry holds several exact
+# matches for one local artifact (duplicate submissions are real — live data
+# shows repeated names). Lower wins, so a definite bad verdict always beats a
+# Verified duplicate: a security gate must never let a duplicate row launder a
+# bad verdict into a pass.
+_MATCH_PREFERENCE: dict[str, int] = {
+    STATUS_UNSAFE: 0,
+    STATUS_CAUTION: 1,
+    STATUS_WITHHELD: 2,
+    STATUS_UNSCORED: 3,
+    STATUS_VERIFIED: 4,
+}
+
+
+def _first_present(record: dict[str, Any], *keys: str) -> Any:
+    """First key whose value is not None.
+
+    Explicitly not `a or b`: a composite_score of 0.0 is falsy but is a real,
+    and maximally alarming, score — `or` would silently discard it.
+    """
+    for key in keys:
+        value = record.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _coerce_score(value: Any) -> float | None:
+    """A score we can safely render, or None.
+
+    Every other API field in this module is isinstance-guarded; this one was
+    not, and the renderer's `float(r.score)` raised ValueError on a
+    `"composite_score": "N/A"` — which escapes the command as a non-zero exit
+    that the contract reads as "policy violated". A field we could not parse
+    must never be able to manufacture a verdict, in either direction: it
+    renders as `-` and the BADGE, which is what the gate actually keys on,
+    still decides.
+
+    `bool` is rejected before the numeric check because `float(True)` is 1.0,
+    and a score of "1.0" invented out of a JSON `true` would be a lie.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _status_from_record(record: dict[str, Any]) -> str:
+    """Map a registry record onto one of the check statuses.
+
+    Order matters: the withheld flag is checked BEFORE the badge, because a
+    withheld aggregate verdict is the registry stating it will not vouch —
+    that must not be read off as "no badge, probably fine".
+    """
+    if record.get("aggregate_verdict_withheld"):
+        return STATUS_WITHHELD
+    badge = _first_present(record, "composite_badge", "current_badge")
+    if badge == "Unsafe":
+        return STATUS_UNSAFE
+    if badge == "Caution":
+        return STATUS_CAUTION
+    if badge == "Verified":
+        return STATUS_VERIFIED
+    # Anything else — null, or a badge string a future API grows that this CLI
+    # has never heard of — is NOT verified. Unrecognised must fail closed.
+    return STATUS_UNSCORED
+
+
+def _match_rows(rows: list[Any], found: _Discovered) -> list[dict[str, Any]]:
+    """Rows that are EXACTLY this artifact (name or repository URL).
+
+    The registry's `q=` is a fuzzy search — querying "server" returns
+    "@4everland/hosting-mcp". Accepting a fuzzy hit would attach some other
+    project's Verified badge to an unknown local artifact, which is the same
+    collapse as scoring an unknown green. Only exact identity counts; anything
+    else stays `unknown`.
+    """
+    matched: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        record = cast(dict[str, Any], row)
+        name = str(record.get("name") or "").strip().lower()
+        repo = _normalise_repo(str(record.get("repository_url") or ""))
+        if (name and name in found.names) or (repo and repo in found.repos):
+            matched.append(record)
+    return matched
+
+
+# How `check` reads the paginated list endpoint.
+#
+# THE BUG THIS EXISTS TO KILL: reading page 1 and reporting a miss as "not in
+# registry". Live, a config entry named `app` produced exactly that — the
+# registry holds EIGHT rows named exactly `app`, every one of them Unsafe, and
+# at page_size=50 all eight sit on page 2 of 16. One page, no match, "not in
+# registry", EXIT 0. A known-Unsafe artifact walked through the gate whose only
+# job is to stop known-Unsafe artifacts.
+#
+# CHECK_PAGE_SIZE is the API's documented maximum (openapi: page_size <= 100).
+# CHECK_MAX_PAGES bounds the read at 1000 rows per term, which at the registry's
+# current size (total_count ~787 for the broadest term measured, 2026-08-12)
+# exhausts even a term that matches everything, with headroom. It is a budget,
+# not an assumption: when the budget runs out with rows still unread we report
+# `unresolved` rather than inventing an answer.
+CHECK_PAGE_SIZE = 100
+CHECK_MAX_PAGES = 10
+
+
+@dataclass(frozen=True)
+class _Search:
+    """The outcome of searching one term, INCLUDING what we did not read."""
+
+    rows: tuple[Any, ...]
+    total: int | None  # the registry's own total_count, when it gave one
+    truncated: bool  # rows remain that we did not read
+
+    @property
+    def scanned(self) -> int:
+        return len(self.rows)
+
+
+def _int_or_none(value: Any) -> int | None:
+    """An int field from the API, or None. `bool` is not an int here."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _search_pages(client: httpx.Client, term: str) -> _Search:
+    """Read up to CHECK_MAX_PAGES pages of `q=term`, reporting any remainder.
+
+    `truncated` is set unless we have POSITIVE evidence the listing was
+    exhausted — `total_pages` says we read the last page, `total_count` says we
+    hold every row, or the server handed back an empty page. Absent that
+    evidence we assume rows remain. Failing closed here is the point: the
+    caller turns `truncated` into its own status, and an unread remainder must
+    never be reported as an absence.
+    """
+    rows: list[Any] = []
+    total: int | None = None
+    for page in range(1, CHECK_MAX_PAGES + 1):
+        response = _request(
+            client,
+            "GET",
+            "/api/v1/servers",
+            params={"q": term, "page_size": CHECK_PAGE_SIZE, "page": page},
+            fatal=False,
+        )
+        if response.status_code != 200:
+            raise RegistryUnreachable(f"search HTTP {response.status_code}")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RegistryUnreachable("malformed search response")
+        body = cast(dict[str, Any], payload)
+        results = body.get("results")
+        if not isinstance(results, list):
+            # A search response with no results LIST is malformed, not empty.
+            # Reading it as empty is how a broken response becomes "not in the
+            # registry", which is the whole failure mode of this module.
+            raise RegistryUnreachable("malformed search response")
+        page_rows = cast(list[Any], results)
+        rows.extend(page_rows)
+        reported = _int_or_none(body.get("total_count"))
+        # Explicitly not `reported or total`: total_count 0 is a real answer
+        # ("nothing matches"), and `or` would discard it as falsy.
+        if reported is not None:
+            total = reported
+        total_pages = _int_or_none(body.get("total_pages"))
+        exhausted = (
+            not page_rows
+            or (total_pages is not None and page >= total_pages)
+            or (total is not None and len(rows) >= total)
+        )
+        if exhausted:
+            return _Search(rows=tuple(rows), total=total, truncated=False)
+    return _Search(rows=tuple(rows), total=total, truncated=True)
+
+
+def _resolve_one(
+    client: httpx.Client,
+    found: _Discovered,
+    search_cache: dict[str, _Search],
+    detail_cache: dict[str, dict[str, Any]],
+) -> _Checked:
+    """Resolve one discovered artifact against the registry."""
+    # ZERO SEARCHABLE TERMS IS "WE NEVER ASKED", NOT "WE ASKED AND IT IS ABSENT".
+    #
+    # `_search_terms` drops candidates under the registry's 2-character `q=`
+    # floor. An artifact whose every candidate identity is 1 character — an
+    # mcpServers key of "a" with a command we cannot derive a package from —
+    # therefore arrives here with `terms == ()`. The loop below would not
+    # execute, `unread` would stay empty, and the function would fall through to
+    # STATUS_UNKNOWN: "not in the registry listing". That is a claim about a
+    # search that was never issued (proved with a recording transport:
+    # QUERIES ISSUED: []), and STATUS_UNKNOWN does not fail the gate at
+    # `--fail-on unsafe`, so the artifact passes.
+    #
+    # This is the SAME defect as the pagination one below, reached through the
+    # term-length gate instead — the third distinct route to "could not
+    # determine" being rendered as "fine" in this one function. Both now land on
+    # STATUS_UNRESOLVED, which is in INCOMPLETE_STATUSES and in no FAIL_ON set,
+    # so it exits 3 and is never a pass and never a verdict.
+    #
+    # It also keeps two shipped claims true: the README's definition of UNKNOWN
+    # as "searched the registry listing to exhaustion and did not find it"
+    # (`grep -n 'to exhaustion' README.md`) and this module's "could not
+    # determine is never a pass, at any --fail-on level".
+    if not found.terms:
+        return _Checked(
+            found=found,
+            status=STATUS_UNRESOLVED,
+            note="no searchable identity: every candidate name is under the registry's "
+            "2-character query minimum, so no search was issued",
+        )
+
+    matches: list[dict[str, Any]] = []
+    unread: list[str] = []
+    try:
+        for term in found.terms:
+            if term not in search_cache:
+                search_cache[term] = _search_pages(client, term)
+            result = search_cache[term]
+            matches = _match_rows(list(result.rows), found)
+            if matches:
+                break
+            if result.truncated:
+                seen = "?" if result.total is None else str(result.total)
+                unread.append(f"{term!r} ({result.scanned} of {seen} rows read)")
+    except (RegistryUnreachable, ValueError) as exc:
+        # ValueError covers a body that is not JSON. Either way we have no
+        # answer, and no answer is not a pass.
+        return _Checked(found=found, status=STATUS_ERROR, note=f"registry: {exc}")
+
+    if not matches:
+        if unread:
+            # WE DO NOT KNOW. The term is too common to resolve at a sane cost,
+            # so say that — as its own status, with its own exit behaviour —
+            # instead of reporting the unread remainder as an absence.
+            return _Checked(
+                found=found,
+                status=STATUS_UNRESOLVED,
+                note="search too broad to read to the end: " + "; ".join(unread),
+            )
+        # (c) NOT IN THE LISTING. Unknown, not safe. The submit funnel says so.
+        return _Checked(found=found, status=STATUS_UNKNOWN, note="not in the registry listing")
+
+    matches.sort(key=lambda r: _MATCH_PREFERENCE.get(_status_from_record(r), 9))
+    row = matches[0]
+    server_id = str(row.get("id") or "")
+
+    # The search row already carries a badge, but the authoritative aggregate
+    # lives on the detail endpoint (`composite_badge` + the scanner reports
+    # that back it). Fetch it — and if that fetch fails, report `error` rather
+    # than quietly falling back to the list row, because a silent fallback is
+    # how "we could not verify" turns into "verified".
+    #
+    # An id that is missing, or that carries path separators (which would let a
+    # malformed response steer the request at another endpoint), is treated the
+    # same way: unusable id -> error. Deliberately NOT "use the search row
+    # instead" — that would be the silent fallback this whole block avoids.
+    if not server_id or "/" in server_id or "?" in server_id:
+        return _Checked(
+            found=found,
+            status=STATUS_ERROR,
+            note="registry: unusable server id in search result",
+            duplicates=len(matches) - 1,
+        )
+    try:
+        if server_id not in detail_cache:
+            response = _request(client, "GET", f"/api/v1/servers/{server_id}", fatal=False)
+            if response.status_code != 200:
+                raise RegistryUnreachable(f"detail HTTP {response.status_code}")
+            body = response.json()
+            if not isinstance(body, dict):
+                raise RegistryUnreachable("malformed detail response")
+            detail_cache[server_id] = cast(dict[str, Any], body)
+        detail = detail_cache[server_id]
+    except (RegistryUnreachable, ValueError) as exc:
+        return _Checked(
+            found=found,
+            status=STATUS_ERROR,
+            server_id=server_id,
+            note=f"registry: {exc}",
+        )
+
+    record = detail
+    status = _status_from_record(record)
+    reports = record.get("scanner_reports")
+    note = ""
+    if status == STATUS_WITHHELD:
+        note = str(record.get("aggregate_verdict_withheld_reason") or "verdict withheld")
+    elif record.get("unscannable_reason"):
+        note = str(record["unscannable_reason"])
+    return _Checked(
+        found=found,
+        status=status,
+        badge=_first_present(record, "composite_badge", "current_badge"),
+        score=_coerce_score(_first_present(record, "composite_score", "current_security_score")),
+        server_id=server_id or None,
+        scanners=len(reports) if isinstance(reports, list) else None,
+        note=note,
+        duplicates=len(matches) - 1,
+    )
+
+
+_STATUS_COLOURS: dict[str, str] = {
+    STATUS_UNSAFE: "red",
+    STATUS_CAUTION: "yellow",
+    STATUS_VERIFIED: "green",
+    STATUS_WITHHELD: "magenta",
+    STATUS_UNSCORED: "magenta",
+    STATUS_UNKNOWN: "magenta",
+    STATUS_UNRESOLVED: "red",
+    STATUS_ERROR: "red",
+}
+# Printed in this order so the things that matter are read first.
+_SUMMARY_ORDER = (
+    STATUS_UNSAFE,
+    STATUS_CAUTION,
+    STATUS_WITHHELD,
+    STATUS_UNSCORED,
+    STATUS_UNKNOWN,
+    STATUS_UNRESOLVED,
+    STATUS_ERROR,
+    STATUS_VERIFIED,
+)
+
+
+@click.command()
+@click.argument(
+    "path",
+    required=False,
+    type=click.Path(exists=True, path_type=Path),
+)
+@click.option(
+    "--fail-on",
+    "fail_on",
+    type=click.Choice(sorted(FAIL_ON_STATUSES)),
+    default="unsafe",
+    show_default=True,
+    help="Exit non-zero at this severity or worse ('any' also fails on unknown).",
+)
+@_api_url_option
+@_json_option
+def check(path: Path | None, fail_on: str, api_url: str, as_json: bool) -> None:
+    """Check locally-configured AI artifacts against the registry (CI gate).
+
+    Reads the same platform configs `nerlo install` writes, resolves each
+    entry against the public registry, and exits non-zero when policy is
+    violated. With no PATH the standard per-user locations are scanned; give a
+    PATH to scan a project checkout instead (the CI case).
+
+    Exit codes: 0 pass, 1 policy violated, 2 usage error, 3 could not
+    determine (registry unreachable, a local config could not be parsed, or a
+    search too broad to read to the end). "Could not determine" is never a
+    pass, at any --fail-on level.
+    """
+    artifacts, unreadable = _discover(path)
+    scope = "project" if path is not None else "standard locations"
+    for problem in unreadable:
+        click.secho(f"warning: could not read config — {problem}", fg="yellow", err=True)
+
+    results: list[_Checked] = []
+    if artifacts:
+        search_cache: dict[str, _Search] = {}
+        detail_cache: dict[str, dict[str, Any]] = {}
+        with _client(api_url) as client:
+            results = [_resolve_one(client, a, search_cache, detail_cache) for a in artifacts]
+
+    counts = {status: sum(1 for r in results if r.status == status) for status in _SUMMARY_ORDER}
+    violations = [r for r in results if r.status in FAIL_ON_STATUSES[fail_on]]
+    # Unreadable local configs are as unresolved as an unreachable registry or
+    # a search we could not read to the end: in every one of those cases
+    # something that should have been checked was not.
+    unresolved = [r for r in results if r.status in INCOMPLETE_STATUSES]
+    if violations:
+        exit_code = EXIT_POLICY_VIOLATION
+    elif unresolved or unreadable:
+        exit_code = EXIT_INCOMPLETE
+    else:
+        exit_code = EXIT_OK
+
+    logger.info(
+        "cli.check",
+        scope=scope,
+        artifacts=len(artifacts),
+        fail_on=fail_on,
+        violations=len(violations),
+        unresolved=len(unresolved),
+        exit_code=exit_code,
+    )
+
+    if as_json:
+        _echo_json(
+            {
+                "scope": scope,
+                "path": str(path) if path is not None else None,
+                "fail_on": fail_on,
+                "exit_code": exit_code,
+                "summary": {"total": len(results), **counts},
+                "unreadable_configs": unreadable,
+                "artifacts": [
+                    {
+                        "name": r.found.name,
+                        "platform": r.found.platform,
+                        "artifact_type": r.found.kind,
+                        "source": r.found.source,
+                        "status": r.status,
+                        "badge": r.badge,
+                        "score": r.score,
+                        "server_id": r.server_id,
+                        "scanners": r.scanners,
+                        "duplicate_matches": r.duplicates,
+                        "note": r.note,
+                    }
+                    for r in results
+                ],
+            }
+        )
+        sys.exit(exit_code)
+
+    if not artifacts:
+        if unreadable:
+            # NOT "nothing to check" — there was something to check and we
+            # could not read it. Saying "nothing to check" here contradicted
+            # the stderr warning and the exit-3 this same run produces.
+            click.secho(
+                f"No AI artifacts could be read in {scope}: "
+                f"{len(unreadable)} config(s) could not be parsed. "
+                "Nothing was verified.",
+                fg="red",
+                bold=True,
+            )
+            click.secho("INCOMPLETE: some configs could not be checked.", fg="red", bold=True)
+        else:
+            # A legitimate pass — but say it in words. An empty table would read
+            # as "checked, all good" when the truth is "nothing to check".
+            click.echo(f"No AI artifacts configured in {scope} — nothing to check.")
+        sys.exit(exit_code)
+
+    _table(
+        [
+            {
+                "status": r.status.upper(),
+                "artifact": r.found.name,
+                "platform": r.found.platform,
+                # `r.score` is already a float or None — `_coerce_score` made it
+                # so at the point the API handed it over, precisely so that this
+                # renderer cannot raise on a junk field and turn "we could not
+                # read a number" into a non-zero exit meaning "policy violated".
+                "score": "-" if r.score is None else f"{r.score:.1f}",
+                "scanners": "-" if r.scanners is None else str(r.scanners),
+                "source": r.found.source,
+            }
+            for r in results
+        ],
+        ["status", "artifact", "platform", "score", "scanners", "source"],
+    )
+    click.echo("")
+    click.echo(
+        "  ".join(
+            click.style(f"{counts[s]} {s}", fg=_STATUS_COLOURS[s])
+            for s in _SUMMARY_ORDER
+            if counts[s]
+        )
+    )
+
+    unknowns = [r for r in results if r.status == STATUS_UNKNOWN]
+    if unknowns:
+        click.echo("")
+        click.secho(
+            f"{len(unknowns)} artifact(s) are NOT in the Nerlo registry listing. "
+            "Unknown is not safe — nobody has scanned these:",
+            fg="magenta",
+            bold=True,
+        )
+        for r in unknowns:
+            click.echo(f"  - {r.found.name}  ({r.found.source})")
+        click.echo("  Get them scanned:  nerlo submit <repository-url>")
+        # Stated as a listing miss, not as proof of absence: the list endpoint
+        # documents that `undistributed` artifacts "are never listed; they
+        # remain retrievable by direct id", so there is a class of row this
+        # search cannot surface at all.
+        click.echo(
+            "  (Searched the registry listing; `undistributed` artifacts are never listed.)"
+        )
+
+    if unresolved:
+        click.echo("")
+        click.secho(
+            f"{len(unresolved)} artifact(s) could not be resolved — this run did NOT "
+            "verify them:",
+            fg="red",
+            bold=True,
+        )
+        for r in unresolved:
+            click.echo(f"  - {r.found.name}: {r.note}")
+
+    click.echo("")
+    if exit_code == EXIT_POLICY_VIOLATION:
+        click.secho(
+            f"FAIL: {len(violations)} artifact(s) violate --fail-on {fail_on}.", fg="red", bold=True
+        )
+    elif exit_code == EXIT_INCOMPLETE:
+        click.secho("INCOMPLETE: some artifacts could not be checked.", fg="red", bold=True)
+    else:
+        click.secho(f"PASS: no artifact violates --fail-on {fail_on}.", fg="green", bold=True)
+    sys.exit(exit_code)
+
+
 # Public consumer commands only. Operator/service commands (jobs, verify, serve,
 # discovery-scheduler, monitor) stay in the backend — they need DB/pipeline
 # internals and are not part of the installable CLI.
-ALL_COMMANDS: list[click.Command] = [search, info, install, submit, rescan]
+ALL_COMMANDS: list[click.Command] = [search, info, install, submit, rescan, check]
 
 __all__ = ["ALL_COMMANDS"]

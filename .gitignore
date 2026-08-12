@@ -7,3 +7,9 @@ dist/
 build/
 *.egg-info/
 .env
+
+# `uv run` writes this on every test run. Deliberately NOT committed: this is a
+# published LIBRARY/CLI, so the dependency contract consumers resolve against is
+# pyproject.toml's ranges, and a committed lock would only pin the maintainer's
+# dev environment while showing up as churn in every PR that ran the tests.
+uv.lock
