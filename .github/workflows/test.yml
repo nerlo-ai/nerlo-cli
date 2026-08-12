@@ -1,0 +1,105 @@
+# The test suite, on the platforms and Python versions this package CLAIMS.
+#
+# WHY THIS FILE EXISTS. Until 2026-08-12 this repo had exactly one workflow —
+# `publish.yml` — so the 82 tests had never run in CI at all. They ran only when a
+# human or an agent remembered to, on one machine, on one Python. Meanwhile
+# `pyproject.toml` advertises `requires-python = ">=3.11"`, a claim nothing
+# checked: the publish job installs 3.12 and only to build a wheel.
+#
+# WHY A MATRIX AND NOT CONTAINERS. The owner asked whether we should build
+# mac/windows/ubuntu/centos containers. You cannot run macOS in a container at
+# all, and Windows containers need a Windows host — so the two platforms with the
+# real differences are exactly the two containers cannot reach. Meanwhile
+# CentOS-vs-Ubuntu is close to meaningless for a package with no compiled
+# dependencies: same CPython, same stdlib, no glibc surface. GitHub's native
+# runners test the axis that matters, for free on a public repo.
+#
+# WHERE PLATFORM ACTUALLY BITES THIS CLI, so the matrix is justified rather than
+# cargo-culted:
+#   * `install` WRITES platform config files. Windows has different atomic-rename
+#     semantics, and a file left half-written is a corrupted MCP config.
+#   * macOS filesystems are case-INSENSITIVE by default; artifact-name matching
+#     that is exact on Linux may be loose there.
+#   * `Path.home()` and `Path.cwd()` resolve differently per OS, and the whole
+#     discovery map in `check` is built from them.
+#   * JSON written with platform line endings round-trips differently.
+#
+# 3.11 IS THE FLOOR AND IS TESTED FIRST-CLASS. It is the version the package
+# promises and the one most likely to break, because nobody develops on it.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      # DO NOT fail-fast. A Windows-only break is the single most likely outcome
+      # here, and fail-fast would cancel the macOS and Linux jobs before telling
+      # us whether the failure is platform-specific or universal — which is the
+      # only question worth asking when one cell goes red.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Installed explicitly rather than from a dependency group: this package
+      # deliberately declares only `click` and `httpx` as runtime deps, and that
+      # leanness is a selling point for a supply-chain security tool. Test-only
+      # tooling stays out of the published metadata.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pytest
+
+      - name: Test
+        run: python -m pytest -q
+
+      # The contract a user actually touches. `pytest` passing while the console
+      # script is broken is a real and unpleasant failure mode — it is the
+      # difference between "the code works" and "the thing you installed works",
+      # and only the second one is what `pip install nerlo` promises.
+      - name: The installed console script runs
+        run: |
+          nerlo version
+          nerlo --help
+
+      # `check` on an empty directory must EXIT 0 and say so in words. This is the
+      # cheapest possible end-to-end assertion of the gate's most important
+      # property — that it does not fail closed on "nothing to check" — and it
+      # runs on every OS, which is where the path handling under it differs.
+      - name: check exits 0 with nothing configured (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p empty-project
+          nerlo check empty-project
+          echo "exit=$?"
+
+      - name: check exits 0 with nothing configured (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path empty-project | Out-Null
+          nerlo check empty-project
+          if ($LASTEXITCODE -ne 0) { throw "expected exit 0, got $LASTEXITCODE" }

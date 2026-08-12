@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from collections.abc import Callable
@@ -293,7 +294,18 @@ def test_installer_token_hash_is_stable_and_hex(
     # installer-id file is created 0600.
     id_path = tmp_path / ".nerlo" / "installer-id"
     assert id_path.exists()
-    assert (id_path.stat().st_mode & 0o777) == 0o600
+    # POSIX ONLY, and this is a platform fact rather than a flaky test.
+    # Windows has no POSIX mode bits: `os.chmod` there toggles a read-only flag
+    # and the file lands 0o666, so asserting 0600 tests the platform, not our
+    # code. Found by the first cross-platform CI run on 2026-08-12 — all three
+    # Windows cells failed here while all six macOS/Linux cells passed, which is
+    # exactly the isolation `fail-fast: false` exists to give.
+    #
+    # SKIPPED, NOT DELETED: the guarantee is real on macOS and Linux and worth
+    # keeping pinned. Deleting the assertion would quietly stop covering them
+    # too, which is how a control becomes decorative.
+    if os.name != "nt":
+        assert (id_path.stat().st_mode & 0o777) == 0o600
     # Token path: deterministic SHA-256 hex of the credential, 64 hex chars.
     token_hash = commands._installer_token_hash("tok")
     assert token_hash == hashlib.sha256(b"tok").hexdigest()
