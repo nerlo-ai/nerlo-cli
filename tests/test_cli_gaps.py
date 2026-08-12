@@ -1683,7 +1683,19 @@ def test_read_config_ignores_comments_and_junk_lines(
     home.mkdir()
     monkeypatch.setenv("NERLO_HOME", str(home))
     (home / "config").write_text(
-        "# a comment\n\n   \nnot-a-pair\ntelemetry = false \n  spaced = value  \n",
+        # The commented line is a KEY=VALUE pair and comes LAST, so a parser
+        # that skipped only blank/pairless lines would let it overwrite the real
+        # setting and silently switch telemetry back on. A comment containing no
+        # `=` cannot detect that, which is how the first draft of this test
+        # passed against a broken parser.
+        "# a comment\n"
+        "\n"
+        "   \n"
+        "not-a-pair\n"
+        "telemetry = false \n"
+        "  spaced = value  \n"
+        "# telemetry=true\n"
+        "   # spaced=clobbered\n",
         encoding="utf-8",
     )
     assert commands._read_config() == {"telemetry": "false", "spaced": "value"}
@@ -1747,8 +1759,15 @@ def test_install_cleans_up_its_temp_file_when_the_write_fails(
     _silent_telemetry(monkeypatch)
     _use_handler(monkeypatch, _verified_skill_handler())
 
+    # Scoped to the staged file by name: `commands.os` IS the stdlib module, so
+    # an unconditional stub would break `os.replace` for everything running
+    # inside the invoke — including anything the harness or httpx does.
+    real_replace = os.replace
+
     def boom(src: Any, dst: Any) -> None:
-        raise OSError(13, "Permission denied")
+        if str(src).endswith(".nerlo-tmp"):
+            raise OSError(13, "Permission denied")
+        real_replace(src, dst)
 
     monkeypatch.setattr(commands.os, "replace", boom)
 
@@ -1823,4 +1842,7 @@ def test_logger_event_without_fields_has_no_trailing_space(
 ) -> None:
     monkeypatch.delenv("NERLO_DEBUG", raising=False)
     _fresh_logger().error("cli.check")
-    assert capsys.readouterr().err == "[error] cli.check\n"
+    # Normalised because this asserts on the WHOLE stream (to catch a trailing
+    # space before the newline), and a bare "\n" is the one thing that could
+    # legitimately differ per OS in a captured text stream.
+    assert capsys.readouterr().err.replace("\r\n", "\n") == "[error] cli.check\n"
