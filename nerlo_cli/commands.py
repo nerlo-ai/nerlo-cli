@@ -379,10 +379,24 @@ def _telemetry_enabled() -> bool:
 
 
 def _anonymous_installer_id() -> str:
-    """Stable anonymous installer id from ~/.nerlo/installer-id (uuid4, 0600).
+    """Stable anonymous installer id from ~/.nerlo/installer-id (uuid4).
 
     Created on first use and reused thereafter, so the derived hash is stable
     across runs for the same machine/user.
+
+    THE 0600 BELOW IS BEST-EFFORT AND IS A NO-OP ON WINDOWS. This docstring said
+    "0600" flatly until 2026-08-12, when the first cross-platform CI run refuted
+    it: Windows has no POSIX mode bits, `os.chmod` there only toggles a read-only
+    flag, and the file lands 0o666. Stated plainly because a comment claiming a
+    permission the platform cannot grant is worse than no comment — someone would
+    reasonably store something sensitive here on its authority.
+
+    Nothing sensitive IS stored here: the contents are a random uuid4 used to
+    make anonymous install telemetry stable per machine. Another local user
+    reading it learns an anonymous id they could largely infer from usage anyway.
+    That is why this is a documentation fix and not a redesign. If a real secret
+    ever needs to live in ~/.nerlo, it needs a Windows-appropriate mechanism
+    (DPAPI or an ACL), not this chmod.
     """
     path = _nerlo_home() / "installer-id"
     with contextlib.suppress(OSError):
