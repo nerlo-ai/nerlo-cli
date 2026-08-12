@@ -47,6 +47,7 @@ CAUTION   acb-tax-mcp                mcp       93.4   9         ./mcp.json
 UNSAFE    accessibility-agents       mcp       -      7         ./mcp.json
 WITHHELD  abap-adt-mcp-server        mcp       -      0         ./mcp.json
 UNKNOWN   totally-made-up-thing-xyz  mcp       -      -         ./mcp.json
+UNRESOLVED app                       mcp       -      -         ./mcp.json
 ```
 
 ### Unknown is not safe
@@ -60,13 +61,26 @@ The three outcomes are reported distinctly and are never collapsed:
 | `UNSAFE` | In the registry, aggregate verdict Unsafe |
 | `WITHHELD` | In the registry — and the registry is **declining to publish a verdict** (insufficient scanner coverage) |
 | `UNSCORED` | In the registry, not yet scored |
-| `UNKNOWN` | **Not in the registry at all.** Nobody has ever scanned this |
+| `UNKNOWN` | **Searched the registry listing to exhaustion and did not find it.** Nobody has scanned this |
+| `UNRESOLVED` | **We do not know.** The search matched more rows than `check` is willing to read, and none of the ones it read were this artifact |
 | `ERROR` | Could not be resolved — the registry did not answer |
 
 `UNKNOWN` is not a pass. Rendering "nobody has looked at this" as a green check
 is the failure this tool exists to prevent, so unknown artifacts get their own
 status, their own callout, and a pointer to `nerlo submit`. The same applies to
-`WITHHELD` and `ERROR`: an absent answer is not a good answer.
+`WITHHELD`, `UNRESOLVED` and `ERROR`: an absent answer is not a good answer.
+
+`UNRESOLVED` is deliberately a different status from `UNKNOWN`, because they are
+different facts and only one of them is safe to act on. `check` reads the
+registry's listing endpoint a page at a time; when it runs out of budget with
+rows still unread it reports what it did not read (`'app' (100 of 787 rows
+read)`) and exits `3`. It does **not** report an unread remainder as an
+absence — that is precisely how eight registry rows named `app`, every one of
+them Unsafe, once produced a green `EXIT 0`.
+
+`UNKNOWN` is also stated as a miss against the **listing**, not as proof of
+absence: the API documents that `undistributed` artifacts "are never listed;
+they remain retrievable by direct id".
 
 ### Exit codes
 
@@ -75,7 +89,7 @@ status, their own callout, and a pointer to `nerlo submit`. The same applies to
 | `0` | Every discovered artifact satisfied the policy. Nothing installed is also a pass — and says so in words rather than printing an empty table |
 | `1` | Policy violated — something is at or worse than `--fail-on` |
 | `2` | Usage error |
-| `3` | **Incomplete** — at least one artifact could not be resolved (registry unreachable, or a local config could not be parsed) and nothing outright violated the policy. A check that could not reach the registry has not passed |
+| `3` | **Incomplete** — at least one artifact could not be resolved (registry unreachable, a local config could not be parsed, or a search too broad to read to the end) and nothing outright violated the policy. A check that could not reach the registry has not passed |
 
 A violation outranks an incomplete: if something is already known to be Unsafe,
 you get `1`, and the unresolved rows are still printed.
@@ -87,6 +101,9 @@ you get `1`, and the unresolved rows are still printed.
 | `unsafe` (default) | `UNSAFE` |
 | `caution` | `UNSAFE`, `CAUTION` |
 | `any` | anything not `VERIFIED`, **including `UNKNOWN`** |
+
+`UNRESOLVED` and `ERROR` are in **none** of these levels: "we could not ask" is
+never a policy verdict. They exit `3` at every level — never `0`.
 
 `unsafe` and `caution` are verdict thresholds and deliberately do not fail on
 unknowns — most of the ecosystem is not in the registry yet, and a gate that
@@ -109,6 +126,18 @@ instead (plus a project-scoped `.mcp.json`) — and **not** the home locations,
 because CI runs in a checkout where `$HOME` belongs to an ephemeral runner and a
 repo's gate should depend on the repo, not on the machine. `PATH` may also be a
 single config file.
+
+In every config it reads both MCP server shapes: the top-level `mcpServers`
+object, and Claude Code's per-project `projects.<path>.mcpServers` nesting in
+`~/.claude.json` — which on a working machine is where most entries actually
+live. Two projects configuring a server under the same name are reported as two
+rows, not one, and each row's `SOURCE` names the project it came from.
+
+Identity for each entry comes from the package name in its `command`/`args`, the
+`repository` URL, and the config key — in that order. The repository URL is
+searched by its path segments because the registry's keyword search does not
+index URLs; without that, a repository-only entry can never be retrieved and so
+can never be matched.
 
 ### Badge-gated install
 

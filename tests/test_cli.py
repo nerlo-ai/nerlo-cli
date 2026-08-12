@@ -24,6 +24,7 @@ import json
 import re
 import subprocess
 from collections.abc import Callable
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -771,6 +772,8 @@ def _registry_handler(
     search_status: int = 200,
     detail_status: int = 200,
     detail_overrides: dict[str, dict[str, Any]] | None = None,
+    max_page_size: int = 100,
+    queries: list[httpx.URL] | None = None,
 ) -> Handler:
     """Stub registry.
 
@@ -778,15 +781,48 @@ def _registry_handler(
     query for "server" returns "@4everland/hosting-mcp"), so returning
     everything is both faithful and the strongest possible test that `check`
     does its own exact-identity matching rather than trusting the search hit.
+
+    IT PAGINATES, and that is load-bearing. The previous version answered every
+    search with the WHOLE row list and `total_count = len(rows)`, so it could
+    not express "there are more rows than this response carries" — which is
+    exactly the state the live registry was in when eight Unsafe rows named
+    `app` sat on page 2 and `check` reported "not in registry", EXIT 0. A
+    harness that cannot represent a truncated page cannot catch that bug, and
+    28 check tests duly did not. So this handler honours `page`/`page_size`
+    like the real endpoint (clamping page_size at `max_page_size`, as the live
+    API clamps at 100) and reports `total_count`/`total_pages` for the FULL set.
+    Drive `max_page_size` down to force multi-page reads; drive it down further
+    than `commands.CHECK_MAX_PAGES` can consume to force a genuine truncation.
+
+    `queries` collects every search URL issued, so a test can assert what was
+    SEARCHED FOR rather than only what was matched — the difference between
+    proving a term is in the identity set and proving a query was sent.
     """
     by_id = {str(r["id"]): r for r in rows}
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path == "/api/v1/servers":
+            if queries is not None:
+                queries.append(request.url)
             if search_status != 200:
                 return _json_response(request, search_status, {})
-            return _json_response(request, 200, {"results": rows, "total_count": len(rows)})
+            params = request.url.params
+            page = max(1, int(params.get("page", 1)))
+            page_size = min(max(1, int(params.get("page_size", 20))), max_page_size)
+            start = (page - 1) * page_size
+            total_pages = (len(rows) + page_size - 1) // page_size
+            return _json_response(
+                request,
+                200,
+                {
+                    "page": page,
+                    "page_size": page_size,
+                    "total_count": len(rows),
+                    "total_pages": total_pages,
+                    "results": rows[start : start + page_size],
+                },
+            )
         if path.startswith("/api/v1/servers/"):
             if detail_status != 200:
                 return _json_response(request, detail_status, {})
@@ -854,9 +890,13 @@ def test_check_unknown_is_not_rendered_as_a_pass(
     combined = _combined(result)
     assert "UNKNOWN" in combined
     assert "VERIFIED" not in combined
-    assert "NOT in the Nerlo registry" in combined
+    assert "NOT in the Nerlo registry listing" in combined
     assert "Unknown is not safe" in combined
     assert "nerlo submit" in combined  # the submission funnel
+    # The claim is scoped to the LISTING, because the list endpoint documents
+    # that `undistributed` artifacts are never listed. "We did not find it" is
+    # a true statement about a search; "it is not in the registry" is not.
+    assert "undistributed" in combined
 
 
 def test_check_withheld_verdict_is_not_verified(
@@ -1269,3 +1309,392 @@ def test_check_reports_a_zero_composite_score(
     result = CliRunner().invoke(commands.check, [str(root), "--json"])
     payload = _json_payload(result)
     assert payload["artifacts"][0]["score"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# nerlo check — an unresolved artifact is never an absent one                  #
+#                                                                             #
+# Everything below this line exists because an adversarial run against the     #
+# LIVE registry found two ways to make `check` print EXIT 0 over a row the     #
+# registry had already marked Unsafe. Both were the same defect: an inability  #
+# to determine a verdict rendering as a pass.                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _decoys(count: int) -> list[dict[str, Any]]:
+    """Filler rows that match nothing, to push a real row off page 1."""
+    return [_row(f"decoy-{i}", "Verified") for i in range(count)]
+
+
+def test_check_finds_a_match_that_is_not_on_the_first_page(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # BLOCKER 1, the "search harder" half. Live: eight rows named exactly `app`,
+    # every one composite_badge Unsafe, all on page 2 of `q=app&page_size=50`
+    # (total_count 780) — one-page resolution called that "not in registry" and
+    # exited 0. `check` must page until the listing is exhausted.
+    root = _project(tmp_path, {"app": _npx("app")})
+    _use_handler(
+        monkeypatch,
+        # page_size clamped to 3, so the Unsafe row is on page 3 of 3.
+        _registry_handler([*_decoys(6), _row("app", "Unsafe")], max_page_size=3),
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unsafe"
+    assert result.exit_code == 1
+
+
+def test_check_truncated_search_is_unresolved_not_not_in_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # BLOCKER 1, the "report honestly" half — the invariant is that AN
+    # UNRESOLVED ARTIFACT MUST NEVER BE INDISTINGUISHABLE FROM AN ABSENT ONE.
+    # Here the budget genuinely runs out with rows unread. The old code
+    # answered "not in registry" + EXIT 0 in exactly this state.
+    monkeypatch.setattr(commands, "CHECK_MAX_PAGES", 1)
+    root = _project(tmp_path, {"app": _npx("app")})
+    _use_handler(
+        monkeypatch,
+        _registry_handler([*_decoys(6), _row("app", "Unsafe")], max_page_size=2),
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    artifact = payload["artifacts"][0]
+    assert artifact["status"] == "unresolved"
+    assert artifact["status"] != "unknown"  # NOT the same fact as absence
+    assert "2 of 7 rows read" in artifact["note"]  # says how much it did not read
+    assert result.exit_code == 3  # and it is not a pass
+
+
+def test_check_truncated_search_is_not_a_pass_at_any_fail_on_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The gate's exit code is its product, so "we could not determine" must be
+    # non-zero at EVERY level — including the laxest one, which is the level a
+    # default CI job actually runs.
+    root = _project(tmp_path, {"app": _npx("app")})
+    for level in sorted(commands.FAIL_ON_STATUSES):
+        monkeypatch.setattr(commands, "CHECK_MAX_PAGES", 1)
+        _use_handler(
+            monkeypatch,
+            _registry_handler([*_decoys(6), _row("app", "Unsafe")], max_page_size=2),
+        )
+        result = CliRunner().invoke(commands.check, [str(root), "--fail-on", level])
+        assert result.exit_code != 0, f"--fail-on {level} passed an unresolved artifact"
+        assert "UNRESOLVED" in _combined(result)
+
+
+def test_check_search_response_without_a_results_list_is_error_not_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A malformed body read as "no results" is the same collapse one level down:
+    # a broken response must not be able to say "not in the registry".
+    root = _project(tmp_path, {"ghost": _npx("ghost")})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(request, 200, {"total_count": 12})
+
+    _use_handler(monkeypatch, handler)
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "error"
+    assert result.exit_code == 3
+
+
+def test_check_stops_paging_once_the_listing_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Positive control for the two tests above: when the registry says the
+    # listing IS exhausted, `check` believes it, reports `unknown`, and does not
+    # burn the whole page budget doing so. Without this, "always truncated"
+    # would pass the truncation tests.
+    root = _project(tmp_path, {"ghost": _npx("ghost")})
+    queries: list[httpx.URL] = []
+    _use_handler(monkeypatch, _registry_handler(_decoys(3), max_page_size=2, queries=queries))
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unknown"
+    assert result.exit_code == 0
+    # 3 rows at 2/page = 2 pages, then it stops — not CHECK_MAX_PAGES pages.
+    assert [q.params.get("page") for q in queries] == ["1", "2"]
+
+
+def test_check_resolves_an_entry_that_has_only_a_repository_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # BLOCKER 2. `_match_rows` matches on repository_url, but a row that was
+    # never RETRIEVED can never be matched, and the registry's q= does not index
+    # repository URLs (live: q=<the full URL> -> 0 results, q=alloydb -> the
+    # row). Live repro: an entry keyed `byrepo` with repository
+    # https://GitHub.com/gemini-cli-extensions/alloydb.git resolved UNKNOWN/exit
+    # 0 while the identical entry keyed `alloydb` resolved UNSAFE/exit 1 — the
+    # same row, two answers, decided by the config key.
+    root = _project(
+        tmp_path,
+        {"byrepo": {"repository": "https://GitHub.com/gemini-cli-extensions/alloydb.git"}},
+    )
+    queries: list[httpx.URL] = []
+    handler = _registry_handler(
+        [_row("alloydb", "Unsafe", repo="https://github.com/gemini-cli-extensions/alloydb")],
+        queries=queries,
+    )
+    _use_handler(monkeypatch, handler)
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unsafe"
+    assert result.exit_code == 1
+    # The repo's own path segment must be ISSUED as a query. Asserting only on
+    # the status would pass on a stub that returns every row for every term.
+    assert "alloydb" in [q.params.get("q") for q in queries]
+
+
+def test_check_issues_the_package_name_as_a_query_not_just_as_a_matcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Mutation survivor: deleting the package name from the search terms left
+    # all 62 tests green, because the stub returns every row for every query —
+    # so the package-name test proved only that the name was in the MATCH set,
+    # never that it was SEARCHED FOR. Against the real fuzzy API that is the
+    # difference between resolving and not.
+    root = _project(tmp_path, {"todoist": _npx("@abhiz123/todoist-mcp-server@1.2.3")})
+    queries: list[httpx.URL] = []
+    _use_handler(
+        monkeypatch,
+        _registry_handler([_row("@abhiz123/todoist-mcp-server", "Unsafe")], queries=queries),
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    assert result.exit_code == 1
+    issued = [q.params.get("q") for q in queries]
+    assert issued[0] == "@abhiz123/todoist-mcp-server"  # first, before the key
+
+
+def test_fail_on_ladder_is_monotonic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Mutation survivor: narrowing FAIL_ON_STATUSES["caution"] to drop
+    # STATUS_UNSAFE left all 62 tests green — nothing asserted that a laxer
+    # -sounding level still catches everything the stricter one does. A gate
+    # whose severity ordering is not monotonic lies about what it enforces.
+    levels = ["unsafe", "caution", "any"]
+    assert sorted(commands.FAIL_ON_STATUSES) == sorted(levels)
+    for lower, higher in pairwise(levels):
+        assert commands.FAIL_ON_STATUSES[lower] < commands.FAIL_ON_STATUSES[higher], (
+            f"--fail-on {higher} must be a strict superset of --fail-on {lower}"
+        )
+    # And end to end, not just as set algebra: an Unsafe artifact fails at every
+    # level, which is the property a user actually depends on.
+    root = _project(tmp_path, {"bad": _npx("bad")})
+    for level in levels:
+        _use_handler(monkeypatch, _registry_handler([_row("bad", "Unsafe")]))
+        result = CliRunner().invoke(commands.check, [str(root), "--fail-on", level])
+        assert result.exit_code == 1, f"Unsafe passed --fail-on {level}"
+
+
+def test_check_never_treats_could_not_ask_as_a_policy_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The other half of the ladder invariant: the statuses that mean "no answer"
+    # are in none of the --fail-on sets (they drive exit 3 instead), so a future
+    # edit cannot quietly reclassify "we could not ask" as a verdict.
+    for statuses in commands.FAIL_ON_STATUSES.values():
+        assert not (statuses & commands.INCOMPLETE_STATUSES)
+    assert commands.STATUS_UNRESOLVED in commands.INCOMPLETE_STATUSES
+    assert commands.STATUS_ERROR in commands.INCOMPLETE_STATUSES
+
+
+def test_check_non_numeric_score_does_not_manufacture_a_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `float(r.score)` in the renderer raised ValueError on "N/A", which escaped
+    # the command as exit 1 — and the contract reads exit 1 as "policy
+    # violated". An unparseable decoration must not be able to invent a verdict.
+    root = _project(tmp_path, {"good": _npx("good")})
+    _use_handler(
+        monkeypatch,
+        _registry_handler(
+            [_row("good", "Verified")],
+            detail_overrides={"id-good": {"composite_score": "N/A"}},
+        ),
+    )
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exception is None, result.exception
+    assert result.exit_code == 0
+    assert "VERIFIED" in _combined(result)
+    payload = _json_payload(
+        CliRunner().invoke(commands.check, [str(root), "--json"]),
+    )
+    assert payload["artifacts"][0]["score"] is None  # rendered as "-", not 1.0
+
+
+def test_check_numeric_string_score_is_still_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Positive control for the guard above: it must coerce, not blanket-discard.
+    root = _project(tmp_path, {"good": _npx("good")})
+    _use_handler(
+        monkeypatch,
+        _registry_handler(
+            [_row("good", "Verified")],
+            detail_overrides={"id-good": {"composite_score": "88.5"}},
+        ),
+    )
+    payload = _json_payload(CliRunner().invoke(commands.check, [str(root), "--json"]))
+    assert payload["artifacts"][0]["score"] == 88.5
+
+
+def _claude_json(path: Path, body: dict[str, Any]) -> None:
+    path.write_text(json.dumps(body), encoding="utf-8")
+
+
+def test_check_discovers_servers_nested_under_projects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Claude Code nests per-project servers under `projects.<path>.mcpServers`
+    # in ~/.claude.json, and on a real machine that is where most entries live —
+    # confirmed against a ~/.claude.json carrying a 10-entry `projects` map.
+    # Reading only the top-level key means default-mode `check` silently skips
+    # them, which is a gate with a hole in the shape of most real installs.
+    config = tmp_path / ".claude.json"
+    _claude_json(
+        config,
+        {
+            "mcpServers": {"top": _npx("top")},
+            "projects": {"/home/dev/work": {"mcpServers": {"nested": _npx("nested")}}},
+        },
+    )
+    _use_handler(
+        monkeypatch, _registry_handler([_row("top", "Verified"), _row("nested", "Unsafe")])
+    )
+    result = CliRunner().invoke(commands.check, [str(config), "--json"])
+    payload = _json_payload(result)
+    statuses = {a["name"]: a["status"] for a in payload["artifacts"]}
+    assert statuses == {"top": "verified", "nested": "unsafe"}
+    assert result.exit_code == 1
+    nested = next(a for a in payload["artifacts"] if a["name"] == "nested")
+    assert "/home/dev/work" in nested["source"]  # says WHICH project it came from
+
+
+def test_check_keeps_same_named_servers_from_different_projects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Two projects may each configure a server called `github`. Merging the
+    # nested maps into one name-keyed dict would drop one of them — an unchecked
+    # artifact looking exactly like an absent one, one layer lower down.
+    config = tmp_path / ".claude.json"
+    _claude_json(
+        config,
+        {
+            "projects": {
+                "/a": {"mcpServers": {"github": _npx("github-a")}},
+                "/b": {"mcpServers": {"github": _npx("github-b")}},
+            }
+        },
+    )
+    _use_handler(
+        monkeypatch,
+        _registry_handler([_row("github-a", "Verified"), _row("github-b", "Unsafe")]),
+    )
+    payload = _json_payload(CliRunner().invoke(commands.check, [str(config), "--json"]))
+    assert len(payload["artifacts"]) == 2
+    assert {a["status"] for a in payload["artifacts"]} == {"verified", "unsafe"}
+
+
+def test_check_malformed_nested_mcp_servers_is_incomplete_not_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A present-but-wrong-shaped nested `mcpServers` may be hiding entries, so
+    # it is unreadable — not empty.
+    config = tmp_path / ".claude.json"
+    _claude_json(config, {"projects": {"/a": {"mcpServers": ["not", "an", "object"]}}})
+    _use_handler(monkeypatch, _registry_handler([]))
+    result = CliRunner().invoke(commands.check, [str(config)])
+    assert result.exit_code == 3
+    assert "could not read config" in _combined(result)
+
+
+def test_check_ignores_a_projects_entry_that_cannot_hold_servers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Positive control for the test above: a scalar project value genuinely
+    # cannot contain an `mcpServers` key, so skipping it hides nothing and must
+    # not red the whole config.
+    config = tmp_path / ".claude.json"
+    _claude_json(
+        config,
+        {"projects": {"/a": "not-an-object", "/b": {"mcpServers": {"real": _npx("real")}}}},
+    )
+    _use_handler(monkeypatch, _registry_handler([_row("real", "Unsafe")]))
+    result = CliRunner().invoke(commands.check, [str(config), "--json"])
+    payload = _json_payload(result)
+    assert [a["name"] for a in payload["artifacts"]] == ["real"]
+    assert result.exit_code == 1
+
+
+def test_check_unparseable_only_project_does_not_claim_nothing_to_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # It exited 3 and warned on stderr while stdout said "No AI artifacts
+    # configured ... nothing to check." — the summary line contradicting the
+    # verdict. A reader who trusts stdout reads a blind spot as a clean scope.
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "mcp.json").write_text("{ this is not json", encoding="utf-8")
+    _use_handler(monkeypatch, _registry_handler([]))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 3
+    assert "nothing to check" not in result.output
+    assert "INCOMPLETE" in result.output
+    assert "could not be parsed" in result.output
+
+
+def test_check_empty_scope_still_says_nothing_to_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Positive control: the genuinely-empty case keeps its plain-words pass.
+    root = tmp_path / "bare"
+    root.mkdir()
+    _use_handler(monkeypatch, _registry_handler([]))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 0
+    assert "nothing to check" in result.output
+    assert "INCOMPLETE" not in result.output
+
+
+def test_search_pages_keeps_a_reported_total_count_of_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `total = reported or total` looks harmless and is not: total_count 0 is a
+    # real answer ("the registry matched nothing"), and `or` discards it as
+    # falsy, leaving the count unknown. Same class as the `composite_score` 0.0
+    # bug already pinned above — a falsy number is still a number.
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Deliberately inconsistent: a body that reports 0 while carrying a row.
+        # It is what the parser does with the 0 that is under test.
+        return _json_response(
+            request,
+            200,
+            {"results": [_row("x", "Verified")], "total_count": 0, "total_pages": 0},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler), base_url="http://x") as client:
+        search = commands._search_pages(client, "q")
+    assert search.total == 0
+    assert search.total is not None
+    assert search.truncated is False
+
+
+def test_check_boolean_score_is_not_read_as_a_number(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `float(True)` is 1.0. A JSON `true` in composite_score must not become a
+    # score of 1.0 — that is a number invented out of a non-number, and 1.0
+    # reads as catastrophic.
+    root = _project(tmp_path, {"good": _npx("good")})
+    _use_handler(
+        monkeypatch,
+        _registry_handler(
+            [_row("good", "Verified")],
+            detail_overrides={"id-good": {"composite_score": True}},
+        ),
+    )
+    payload = _json_payload(CliRunner().invoke(commands.check, [str(root), "--json"]))
+    assert payload["artifacts"][0]["score"] is None
