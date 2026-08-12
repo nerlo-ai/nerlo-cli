@@ -1017,6 +1017,23 @@ _PACKAGE_RUNNERS: dict[str, frozenset[str]] = {
     "pnpm": frozenset({"dlx", "exec"}),
     "uv": frozenset({"tool", "run"}),
 }
+# Executable suffixes a Windows-authored config records on the runner.
+#
+# `.cmd` FIRST BECAUSE IT IS THE COMMON ONE: npm installs its runners on Windows
+# as batch shims (`npx.cmd`, `pnpm.cmd`), and MCP config examples for Windows
+# spell them that way. This list stripped only `.exe` until a coverage audit
+# reached the line, which meant the commonest Windows spelling fell through to
+# `_PACKAGE_RUNNERS.get("npx.cmd") -> None`: `check` could not name the package,
+# resolved the entry by its user-chosen config key alone, found no match, and
+# reported a registry-listed artifact as `unknown`. `unknown` does not fail
+# `--fail-on unsafe`, so a Windows gate silently degraded — the same
+# "could-not-determine renders as fine" shape this module exists to prevent,
+# reached through the platform instead of through the network.
+#
+# Widening this cannot create a false identity: the stripped name must still be
+# a key of `_PACKAGE_RUNNERS` above, so `evil.cmd` -> `evil` still resolves to
+# None and the entry keeps being reported under its config key.
+_RUNNER_EXECUTABLE_SUFFIXES: tuple[str, ...] = (".cmd", ".exe", ".bat")
 
 
 @dataclass(frozen=True)
@@ -1073,8 +1090,10 @@ def _package_from_command(command: str, args: Any) -> str | None:
     badge is worse than reporting the entry under its config key alone.
     """
     runner = Path(str(command or "")).name.lower()
-    if runner.endswith(".exe"):
-        runner = runner[:-4]
+    for suffix in _RUNNER_EXECUTABLE_SUFFIXES:
+        if runner.endswith(suffix):
+            runner = runner[: -len(suffix)]
+            break
     subcommands = _PACKAGE_RUNNERS.get(runner)
     if subcommands is None or not isinstance(args, list):
         return None
