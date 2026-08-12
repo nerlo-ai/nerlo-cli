@@ -1,0 +1,56 @@
+# `nerlo-cli` — a NAME RESERVATION that redirects to the real package, `nerlo`.
+#
+# WHY THIS EXISTS. The GitHub repository is `nerlo-ai/nerlo-cli` and the PyPI
+# distribution is `nerlo`. That mismatch is not hypothetical friction: on
+# 2026-08-12 the owner ran `pipx install nerlo-cli`, got "No matching
+# distribution found", and was following nerlo.ai/cli — which published that
+# exact wrong command. An agent had made the same error hours earlier, checking
+# pypi.org/pypi/nerlo-cli, getting a 404, and concluding the CLI was unpublished.
+# Two people, same mistake, from the repo name alone.
+#
+# THE SECURITY ARGUMENT IS THE REAL ONE. `nerlo-cli` was UNCLAIMED. Anyone could
+# register it, and every reader who had seen the old install copy — or who simply
+# guesses from the repo name — would install a stranger's package believing it
+# was ours. For a supply-chain security tool that is the precise attack we exist
+# to detect, run against us, through our own documentation. Claiming the name
+# closes it permanently: PyPI never releases a name to someone else once taken.
+#
+# IT IS A REDIRECT, NOT A FORK, AND THAT IS DELIBERATE. This distribution ships
+# NO modules and NO console scripts. It declares one dependency — `nerlo` — so
+# `pip install nerlo-cli` resolves to the real package and the `nerlo` command
+# comes from there. A second copy of the code would be a second thing to keep in
+# step, and the day it drifts is the day the alias becomes its own hazard.
+#
+# THE VERSION FLOOR IS DELIBERATE TOO: `>=0.2.0` rather than `==`. A pin would
+# freeze anyone who installed via the alias onto whatever version shipped the day
+# they typed it, including past a security fix in the real package. The floor is
+# 0.2.0 because that is the first release containing `nerlo check`, so nobody
+# arriving through this name lands on a build without the gate.
+[project]
+name = "nerlo-cli"
+version = "0.2.0"
+description = "Deprecated alias for the `nerlo` package. Installs nerlo; use `pip install nerlo` directly."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Nerlo" }]
+keywords = ["mcp", "security", "registry", "cli", "nerlo"]
+dependencies = ["nerlo>=0.2.0"]
+
+[project.urls]
+Homepage = "https://nerlo.ai"
+Registry = "https://nerlo.ai/servers"
+Source = "https://github.com/nerlo-ai/nerlo-cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# No packages to build — this distribution is metadata only. `force-include`
+# with an empty mapping keeps hatchling from guessing at a source layout and
+# accidentally vendoring the real package alongside it.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.sdist]
+include = ["README.md", "pyproject.toml"]
