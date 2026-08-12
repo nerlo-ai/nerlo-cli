@@ -1,0 +1,90 @@
+# Publishes the `nerlo-cli` NAME RESERVATION (see `alias/pyproject.toml`).
+#
+# SEPARATE FROM `publish.yml` ON PURPOSE. That workflow publishes the real
+# package, `nerlo`, and its trusted-publishing identity is bound to the PyPI
+# project of that name. `nerlo-cli` is a DIFFERENT PyPI project and needs its own
+# pending publisher, so folding the two into one job would mean a single failure
+# in the alias could block a real release — and a release is the thing that must
+# not be blocked by a courtesy package.
+#
+# IT IS ALSO MANUAL-ONLY, deliberately. `publish.yml` fires on
+# `release: published`, which is right for software people run. This one fires
+# only on `workflow_dispatch`, because the alias should change almost never: its
+# whole content is one dependency line. Publishing it on every release would burn
+# a version number each time to say the same thing, and PyPI never lets a version
+# be reused or a name be reclaimed.
+#
+# ONE-TIME SETUP, WHICH ONLY THE PYPI ACCOUNT OWNER CAN DO. Before the first run,
+# add a PENDING PUBLISHER at pypi.org -> Your account -> Publishing:
+#     PyPI Project Name: nerlo-cli
+#     Owner:             nerlo-ai
+#     Repository name:   nerlo-cli
+#     Workflow name:     publish-alias.yml
+#     Environment name:  pypi
+# Note the workflow name differs from the one registered for `nerlo`
+# (`publish.yml`) — a pending publisher is scoped to a specific workflow file, so
+# reusing the existing registration will NOT authorise this job.
+#
+# NO API TOKEN, HERE OR ANYWHERE. Trusted publishing over OIDC means there is no
+# secret to store, leak or rotate, and the identity cannot be used from outside
+# this repository's workflow. That property is worth more on the alias than on
+# the real package: a squatter who compromised a token for a name people already
+# trust is exactly the attack this reservation exists to prevent.
+
+name: Publish alias to PyPI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-alias:
+    name: Build + publish nerlo-cli (trusted publishing)
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # required for OIDC trusted publishing
+    defaults:
+      run:
+        working-directory: alias
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --upgrade build
+      - run: python -m build
+
+      # THE ALIAS MUST SHIP NO CODE, and that is asserted rather than assumed.
+      # A metadata-only distribution that quietly acquired a module would be a
+      # second copy of the CLI under a name people trust — the exact thing the
+      # reservation exists to stop, arriving from inside. `bypass-selection` in
+      # its pyproject is what keeps hatchling from guessing a source layout, but
+      # a build-config change could undo that silently, so the wheel is checked.
+      - name: The wheel is metadata only
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel, got {wheels}")
+
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          code = [n for n in names if n.endswith((".py", ".so", ".pyd"))]
+          if code:
+              sys.exit(
+                  f"the alias wheel ships code, which it must never do: {code}. "
+                  "It exists to redirect to `nerlo`, not to duplicate it."
+              )
+          print(f"ok: {wheels[0]} contains only {sorted(names)}")
+          PY
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: alias/dist
