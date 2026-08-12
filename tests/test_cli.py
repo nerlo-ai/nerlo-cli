@@ -733,3 +733,539 @@ def test_install_gemini_extension_placeholder_exits_zero(
     assert "install path pending Google runtime API" in _combined(result)
     assert not config.exists()  # nothing written anywhere
     assert not (home / ".claude").exists()
+
+
+# --------------------------------------------------------------------------- #
+# nerlo check — the CI gate (exit codes are the contract)                     #
+# --------------------------------------------------------------------------- #
+
+
+def _row(
+    name: str,
+    badge: str | None,
+    *,
+    row_id: str = "",
+    repo: str = "",
+    withheld: bool = False,
+    score: float | None = 90.0,
+) -> dict[str, Any]:
+    """One registry search row, shaped like the live API's response.
+
+    Real ids are opaque UUIDs, so the derived stub id is slug-safe — a package
+    name like `@scope/pkg` must not leak a `/` into the detail URL.
+    """
+    return {
+        "id": row_id or "id-" + re.sub(r"[^a-z0-9._-]", "-", name.lower()),
+        "name": name,
+        "repository_url": repo,
+        "current_badge": badge,
+        "current_security_score": None if badge is None else score,
+        "aggregate_verdict_withheld": withheld,
+        "artifact_type": "mcp_server",
+    }
+
+
+def _registry_handler(
+    rows: list[dict[str, Any]],
+    *,
+    search_status: int = 200,
+    detail_status: int = 200,
+    detail_overrides: dict[str, dict[str, Any]] | None = None,
+) -> Handler:
+    """Stub registry.
+
+    Search returns EVERY row regardless of `q` — the live `q=` is fuzzy (a
+    query for "server" returns "@4everland/hosting-mcp"), so returning
+    everything is both faithful and the strongest possible test that `check`
+    does its own exact-identity matching rather than trusting the search hit.
+    """
+    by_id = {str(r["id"]): r for r in rows}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/servers":
+            if search_status != 200:
+                return _json_response(request, search_status, {})
+            return _json_response(request, 200, {"results": rows, "total_count": len(rows)})
+        if path.startswith("/api/v1/servers/"):
+            if detail_status != 200:
+                return _json_response(request, detail_status, {})
+            row = by_id.get(path.rsplit("/", 1)[-1])
+            if row is None:
+                return _json_response(request, 404, {})
+            detail = dict(row)
+            detail["composite_badge"] = row["current_badge"]
+            detail["composite_score"] = row["current_security_score"]
+            detail["scanner_reports"] = [{"scanner_name": "s1"}, {"scanner_name": "s2"}]
+            detail.update((detail_overrides or {}).get(str(row["id"]), {}))
+            return _json_response(request, 200, detail)
+        return _json_response(request, 404, {})
+
+    return handler
+
+
+def _project(tmp_path: Path, servers: dict[str, Any], filename: str = "mcp.json") -> Path:
+    """A project checkout carrying a platform MCP config."""
+    root = tmp_path / "proj"
+    root.mkdir(exist_ok=True)
+    target = root / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+    return root
+
+
+def _npx(package: str) -> dict[str, Any]:
+    """The runnable entry shape `_build_mcp_entry` writes for npm packages."""
+    return {"command": "npx", "args": ["-y", package]}
+
+
+# --- the one design rule: three outcomes, never collapsed ------------------- #
+
+
+def test_check_reports_found_bad_found_good_and_not_found_distinctly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # (a) found+Unsafe, (b) found+Verified, (c) not in the registry at all.
+    # All three must be visibly distinct; (c) must NOT render as a pass.
+    root = _project(
+        tmp_path,
+        {"bad": _npx("bad"), "good": _npx("good"), "ghost": _npx("ghost")},
+    )
+    _use_handler(
+        monkeypatch,
+        _registry_handler([_row("bad", "Unsafe"), _row("good", "Verified")]),
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    statuses = {a["name"]: a["status"] for a in payload["artifacts"]}
+    assert statuses == {"bad": "unsafe", "good": "verified", "ghost": "unknown"}
+    # The three are distinct values — none of them is spelled as another.
+    assert len(set(statuses.values())) == 3
+
+
+def test_check_unknown_is_not_rendered_as_a_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An artifact nobody has scanned must be called out as unknown and pointed
+    # at the submit funnel — never shown as verified/green.
+    root = _project(tmp_path, {"ghost": _npx("ghost")})
+    _use_handler(monkeypatch, _registry_handler([_row("other", "Verified")]))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    combined = _combined(result)
+    assert "UNKNOWN" in combined
+    assert "VERIFIED" not in combined
+    assert "NOT in the Nerlo registry" in combined
+    assert "Unknown is not safe" in combined
+    assert "nerlo submit" in combined  # the submission funnel
+
+
+def test_check_withheld_verdict_is_not_verified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Live data has rows with aggregate_verdict_withheld=true and a null badge:
+    # the registry declining to vouch. That is its own outcome, not a pass.
+    root = _project(tmp_path, {"held": _npx("held")})
+    _use_handler(monkeypatch, _registry_handler([_row("held", None, withheld=True)]))
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "withheld"
+    # And it fails the strict level, because it is not a verification.
+    strict = CliRunner().invoke(commands.check, [str(root), "--fail-on", "any"])
+    assert strict.exit_code == 1
+
+
+# --- exit codes: the contract ---------------------------------------------- #
+
+
+def test_check_exits_1_on_unsafe_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _project(tmp_path, {"bad": _npx("bad")})
+    _use_handler(monkeypatch, _registry_handler([_row("bad", "Unsafe")]))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 1
+    assert "FAIL" in _combined(result)
+
+
+def test_check_exits_0_when_all_verified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _project(tmp_path, {"good": _npx("good")})
+    _use_handler(monkeypatch, _registry_handler([_row("good", "Verified")]))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 0
+    assert "PASS" in _combined(result)
+
+
+def test_check_caution_passes_by_default_and_fails_at_caution_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _project(tmp_path, {"meh": _npx("meh")})
+    _use_handler(monkeypatch, _registry_handler([_row("meh", "Caution")]))
+    default = CliRunner().invoke(commands.check, [str(root)])
+    assert default.exit_code == 0
+    strict = CliRunner().invoke(commands.check, [str(root), "--fail-on", "caution"])
+    assert strict.exit_code == 1
+
+
+def test_check_unknown_passes_by_default_but_fails_on_any(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The deliberate policy call: unknown is loud but non-fatal at the verdict
+    # levels (a gate that red-builds every repo on day one gets deleted), and
+    # fatal at --fail-on any (absence of evidence treated as failure).
+    root = _project(tmp_path, {"ghost": _npx("ghost")})
+    _use_handler(monkeypatch, _registry_handler([]))
+    assert CliRunner().invoke(commands.check, [str(root)]).exit_code == 0
+    assert CliRunner().invoke(commands.check, [str(root), "--fail-on", "caution"]).exit_code == 0
+    assert CliRunner().invoke(commands.check, [str(root), "--fail-on", "any"]).exit_code == 1
+
+
+def test_check_network_failure_is_exit_3_not_a_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A check that cannot reach the registry has verified nothing. It must not
+    # exit 0, and it must say so.
+    root = _project(tmp_path, {"good": _npx("good")})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("registry down", request=request)
+
+    _use_handler(monkeypatch, handler)
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 3
+    combined = _combined(result)
+    assert "ERROR" in combined
+    assert "could not be resolved" in combined
+    assert "PASS" not in combined
+
+
+def test_check_search_http_error_is_exit_3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A 500 from the registry is also "no answer", not "no problem".
+    root = _project(tmp_path, {"good": _npx("good")})
+    _use_handler(monkeypatch, _registry_handler([_row("good", "Verified")], search_status=500))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 3
+
+
+def test_check_detail_failure_does_not_fall_back_to_the_search_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Search says Verified but the authoritative detail fetch fails. Reporting
+    # the list row's badge here would turn "could not verify" into "verified".
+    root = _project(tmp_path, {"good": _npx("good")})
+    _use_handler(monkeypatch, _registry_handler([_row("good", "Verified")], detail_status=503))
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "error"
+    assert payload["exit_code"] == 3
+    assert result.exit_code == 3
+
+
+def test_check_violation_outranks_incomplete(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # One Unsafe (known) plus one unresolvable: exit 1, the actionable signal,
+    # and the unresolved row is still reported.
+    root = _project(tmp_path, {"bad": _npx("bad"), "boom": _npx("boom")})
+    _use_handler(
+        monkeypatch,
+        _registry_handler(
+            [_row("bad", "Unsafe"), _row("boom", "Verified")],
+            detail_overrides={"id-boom": {}},
+            detail_status=200,
+        ),
+    )
+    # Make only the second artifact unresolvable by failing its detail call.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/servers":
+            return _json_response(
+                request, 200, {"results": [_row("bad", "Unsafe"), _row("boom", "Verified")]}
+            )
+        if request.url.path.endswith("id-boom"):
+            return _json_response(request, 500, {})
+        return _json_response(
+            request, 200, {**_row("bad", "Unsafe"), "composite_badge": "Unsafe"}
+        )
+
+    _use_handler(monkeypatch, handler)
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    statuses = {a["name"]: a["status"] for a in payload["artifacts"]}
+    assert statuses == {"bad": "unsafe", "boom": "error"}
+    assert result.exit_code == 1  # violation wins over incomplete
+
+
+def test_check_nonexistent_path_is_usage_error_exit_2() -> None:
+    result = CliRunner().invoke(commands.check, ["/no/such/directory/anywhere"])
+    assert result.exit_code == 2
+
+
+def test_check_empty_is_an_explicit_pass_not_an_empty_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "bare"
+    root.mkdir()
+    _use_handler(monkeypatch, _registry_handler([]))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 0
+    assert "nothing to check" in _combined(result)
+    assert "STATUS" not in result.output  # no bare table header
+
+
+def test_check_unreadable_config_is_incomplete_not_a_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A config we could not parse is an UNCHECKED config. Treating it as "no
+    # artifacts configured" would report a clean pass over a blind spot.
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "mcp.json").write_text("{ this is not json", encoding="utf-8")
+    _use_handler(monkeypatch, _registry_handler([]))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 3
+    assert "could not read config" in _combined(result)
+
+
+# --- discovery: the reader must parse what the writer produces -------------- #
+
+
+def test_check_reads_back_what_install_wrote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # End-to-end round trip: `install` writes an mcpServers entry, `check`
+    # discovers and resolves that exact entry. This is what stops the reader
+    # from drifting away from the writer's on-disk shape.
+    posts: list[httpx.Request] = []
+    monkeypatch.setattr(commands, "_telemetry_client", _recording_telemetry_client(posts))
+    config = tmp_path / "proj" / "mcp.json"
+    config.parent.mkdir()
+    monkeypatch.setitem(commands.TARGET_CONFIG_PATHS, "mcp", config)
+    _use_handler(monkeypatch, _skill_handler("Verified"))
+    installed = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
+    assert installed.exit_code == 0, _combined(installed)
+
+    # `_build_mcp_entry` turned the npmjs repo into `npx -y demo`; check must
+    # recover the package identity "demo" from it.
+    _use_handler(monkeypatch, _registry_handler([_row("demo", "Unsafe")]))
+    result = CliRunner().invoke(commands.check, [str(config), "--json"])
+    payload = _json_payload(result)
+    assert [a["name"] for a in payload["artifacts"]] == ["demo-skill"]
+    assert payload["artifacts"][0]["status"] == "unsafe"
+    assert result.exit_code == 1
+
+
+def test_check_matches_on_package_name_not_just_config_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The mcpServers key is user-chosen ("todoist"); the registry knows the
+    # package ("@abhiz123/todoist-mcp-server"). Identity comes from the args.
+    root = _project(tmp_path, {"todoist": _npx("@abhiz123/todoist-mcp-server@1.2.3")})
+    _use_handler(monkeypatch, _registry_handler([_row("@abhiz123/todoist-mcp-server", "Unsafe")]))
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unsafe"  # version pin stripped
+
+
+def test_check_matches_on_repository_url_for_non_package_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `_build_mcp_entry` writes {"repository": ...} when there is no runnable
+    # package; that URL is the identity, normalised across .git/case/slash.
+    root = _project(
+        tmp_path,
+        {"whatever": {"repository": "https://GitHub.com/o/r.git", "nerlo_badge": "Verified"}},
+    )
+    _use_handler(
+        monkeypatch,
+        _registry_handler([_row("unrelated-name", "Unsafe", repo="https://github.com/o/r/")]),
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unsafe"
+
+
+def test_check_does_not_accept_a_fuzzy_search_hit_as_a_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The registry's q= is fuzzy. Attaching some other project's Verified badge
+    # to a local artifact is the same collapse as scoring an unknown green.
+    root = _project(tmp_path, {"my-private-server": _npx("my-private-server")})
+    _use_handler(monkeypatch, _registry_handler([_row("some-other-server", "Verified")]))
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unknown"
+    assert payload["artifacts"][0]["server_id"] is None
+
+
+def test_check_duplicate_registry_rows_take_the_worst_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Duplicate submissions of one name are real in live data. A Verified
+    # duplicate must never launder an Unsafe one into a pass.
+    root = _project(tmp_path, {"dup": _npx("dup")})
+    _use_handler(
+        monkeypatch,
+        _registry_handler(
+            [_row("dup", "Verified", row_id="id-ok"), _row("dup", "Unsafe", row_id="id-bad")]
+        ),
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unsafe"
+    assert payload["artifacts"][0]["duplicate_matches"] == 1
+    assert result.exit_code == 1
+
+
+def test_check_discovers_installed_claude_skills(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `_install_claude_skill` copies skill dirs under <root>/.claude/skills/;
+    # discovery reads that same layout back.
+    root = tmp_path / "proj"
+    skill = root / ".claude" / "skills" / "demo-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+    staging = root / ".claude" / "skills" / ".demo-skill.tmp.nerlo-tmp"
+    staging.mkdir()
+    (staging / "SKILL.md").write_text("# staging leftover\n", encoding="utf-8")
+    _use_handler(monkeypatch, _registry_handler([_row("demo-skill", "Unsafe")]))
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    # The installer's dot-prefixed staging dir is not a discovered artifact.
+    assert [a["name"] for a in payload["artifacts"]] == ["demo-skill"]
+    assert payload["artifacts"][0]["artifact_type"] == "claude_skill"
+    assert payload["artifacts"][0]["status"] == "unsafe"
+
+
+def test_check_reads_project_scoped_dot_mcp_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Claude Code's project-scoped `.mcp.json` is a discovery-only extra; a CI
+    # gate that cannot see it is a gate with a hole.
+    root = _project(tmp_path, {"bad": _npx("bad")}, filename=".mcp.json")
+    _use_handler(monkeypatch, _registry_handler([_row("bad", "Unsafe")]))
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 1
+
+
+def test_check_with_a_path_does_not_scan_the_home_locations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # CI runs in a checkout where $HOME belongs to an ephemeral runner. A
+    # project scan must depend on the repo, not on the machine.
+    home = _fake_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        commands,
+        "TARGET_CONFIG_PATHS",
+        {"claude-code": home / ".claude.json", "mcp": home / "mcp.json"},
+    )
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"runner-global": _npx("runner-global")}}), encoding="utf-8"
+    )
+    root = _project(tmp_path, {"in-repo": _npx("in-repo")})
+    _use_handler(
+        monkeypatch,
+        _registry_handler([_row("in-repo", "Verified"), _row("runner-global", "Unsafe")]),
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert [a["name"] for a in payload["artifacts"]] == ["in-repo"]
+    assert result.exit_code == 0  # the runner's Unsafe global did not leak in
+
+
+def test_check_without_a_path_scans_the_standard_locations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The positive control for the test above: with no PATH, the same home
+    # config IS scanned (so its absence there is isolation, not blindness).
+    home = _fake_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(commands, "TARGET_CONFIG_PATHS", {"claude-code": home / ".claude.json"})
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"runner-global": _npx("runner-global")}}), encoding="utf-8"
+    )
+    _use_handler(monkeypatch, _registry_handler([_row("runner-global", "Unsafe")]))
+    result = CliRunner().invoke(commands.check, ["--json"])
+    payload = _json_payload(result)
+    assert [a["name"] for a in payload["artifacts"]] == ["runner-global"]
+    assert result.exit_code == 1
+
+
+def test_check_json_carries_the_exit_code_and_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _project(tmp_path, {"bad": _npx("bad"), "good": _npx("good")})
+    _use_handler(
+        monkeypatch, _registry_handler([_row("bad", "Unsafe"), _row("good", "Verified")])
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["exit_code"] == result.exit_code == 1
+    assert payload["fail_on"] == "unsafe"
+    assert payload["summary"]["total"] == 2
+    assert payload["summary"]["unsafe"] == 1
+    assert payload["summary"]["verified"] == 1
+
+
+def test_check_unknown_badge_string_is_not_verified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A badge value a future API grows must fail closed, not read as a pass.
+    root = _project(tmp_path, {"new": _npx("new")})
+    _use_handler(monkeypatch, _registry_handler([_row("new", "Sparkling")]))
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unscored"
+    assert CliRunner().invoke(commands.check, [str(root), "--fail-on", "any"]).exit_code == 1
+
+
+def test_check_does_not_invent_an_identity_for_opaque_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `node server.js` names no package. Guessing "server.js" could match some
+    # unrelated registry row; the entry resolves on its config key alone.
+    root = _project(tmp_path, {"local-thing": {"command": "node", "args": ["server.js"]}})
+    _use_handler(monkeypatch, _registry_handler([_row("server.js", "Verified")]))
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "unknown"
+
+
+def test_check_match_without_a_usable_id_is_error_not_a_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A matched row whose id is missing cannot be resolved to an authoritative
+    # verdict. Reading the badge off the search row instead would be the silent
+    # fallback that turns "could not verify" into "verified".
+    root = _project(tmp_path, {"good": _npx("good")})
+    row = _row("good", "Verified")
+    row["id"] = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(request, 200, {"results": [row]})
+
+    _use_handler(monkeypatch, handler)
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["status"] == "error"
+    assert result.exit_code == 3
+
+
+def test_check_reports_a_zero_composite_score(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 0.0 is falsy but is a real — and maximally alarming — score. Picking the
+    # score with `a or b` would discard it and report the rosier list value.
+    root = _project(tmp_path, {"bad": _npx("bad")})
+    _use_handler(
+        monkeypatch,
+        _registry_handler(
+            [_row("bad", "Unsafe", score=99.0)],
+            detail_overrides={"id-bad": {"composite_score": 0.0}},
+        ),
+    )
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    assert payload["artifacts"][0]["score"] == 0.0
