@@ -3,7 +3,7 @@ name: Publish to PyPI
 # Tokenless publishing via PyPI Trusted Publishing (OIDC) — no API token is
 # stored anywhere. Fires when a GitHub Release is published (or manually).
 #
-# One-time PyPI setup (Topher, only you can): pypi.org -> your account ->
+# One-time PyPI setup (repo owner only): pypi.org -> your account ->
 # "Publishing" -> "Add a pending publisher":
 #     PyPI Project Name: nerlo
 #     Owner:             nerlo-ai
