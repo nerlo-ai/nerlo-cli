@@ -1,6 +1,6 @@
 [project]
 name = "nerlo"
-version = "0.1.0"
+version = "0.2.0"
 description = "Nerlo CLI — search, inspect, and install MCP servers from the Nerlo security registry"
 readme = "README.md"
 requires-python = ">=3.11"
