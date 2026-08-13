@@ -1599,6 +1599,110 @@ def test_check_json_lists_the_unreadable_config(tmp_path: Path) -> None:
     assert payload["artifacts"] == []
 
 
+def test_check_zero_artifacts_from_unreadable_configs_says_READ_not_CONFIGURED(
+    tmp_path: Path,
+) -> None:
+    """The all-unreadable headline must say "could be READ", never "configured".
+
+    Found by mutation, 2026-08-13 PT. The existing coverage of this branch pins
+    the tail of the message ("Nothing was verified", `grep -n 'Nothing was
+    verified' tests/test_cli_gaps.py`) and the exit code, but nothing pinned the
+    HEADLINE. Substituting
+
+        "No AI artifacts could be read in {scope}: ..."
+     -> "No AI artifacts configured in {scope}: ..."
+
+    left the whole suite green while the first line a human reads flipped from
+    "we could not read your configs" to "you have no configs" — the empty-vs-
+    unreadable collapse, reached through the wording instead of the exit code.
+    Exit 3 was still correct, which is exactly why no test noticed: the machine
+    contract held and the human one did not, and on this command the human
+    sentence is half the product.
+
+    The two readings must stay distinguishable in both directions, so this pins
+    the negative too: the "nothing to check" wording belongs to the genuinely
+    empty tree and must never appear here.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "mcp.json").write_text("{ this is not json", encoding="utf-8")
+
+    result = CliRunner().invoke(commands.check, [str(root)])
+    assert result.exit_code == 3
+    combined = _combined(result)
+    assert "could not be read" in combined or "could be read" in combined
+    assert "No AI artifacts could be read" in combined
+    assert "config(s) could not be parsed" in combined
+    # The empty-tree wording is reserved for the empty tree.
+    assert "configured in" not in combined
+    assert "nothing to check" not in combined
+
+
+def test_check_rejects_a_server_id_that_could_steer_the_detail_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An `id` carrying path separators is an error, not a redirected fetch.
+
+    Found by mutation, 2026-08-13 PT: deleting the `"/" in server_id` and
+    `"?" in server_id` guards (`grep -n 'unusable server id' nerlo_cli/
+    commands.py`) left the suite green. The guard is the only thing stopping a
+    malformed or hostile search row from choosing which endpoint the detail
+    fetch hits — `id` is interpolated straight into
+    `/api/v1/servers/{server_id}`, so an id of `../../healthz` or
+    `x?admin=1` walks the request off the endpoint whose answer the gate then
+    reports as a verdict.
+
+    Both halves are asserted: the request must NOT be issued, and the artifact
+    must land on `error` (in INCOMPLETE_STATUSES, in no FAIL_ON set) rather
+    than inheriting the search row's badge. The second half matters most — the
+    search row here is Verified, so a fallback would render a hostile id as a
+    green pass.
+    """
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/api/v1/servers":
+            return _json_response(
+                request,
+                200,
+                {
+                    "results": [
+                        {
+                            "id": "../../healthz",
+                            "name": "demo",
+                            "repository_url": "",
+                            "composite_badge": "Verified",
+                            "composite_score": 99.0,
+                        }
+                    ],
+                    "total_count": 1,
+                    "total_pages": 1,
+                },
+            )
+        return _json_response(request, 200, {})
+
+    _use_handler(monkeypatch, handler)
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"demo": {"command": "npx", "args": ["-y", "demo"]}}}),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(commands.check, [str(root), "--json"])
+    payload = _json_payload(result)
+    artifact = payload["artifacts"][0]
+    assert artifact["status"] == "error", artifact
+    assert "unusable server id" in artifact["note"]
+    # The Verified badge on the search row must NOT have been inherited.
+    assert artifact["badge"] is None
+    assert artifact["score"] is None
+    # And no detail request was issued at all.
+    assert all(not p.startswith("/api/v1/servers/") for p in requested), requested
+    assert result.exit_code == 3
+
+
 # --------------------------------------------------------------------------- #
 # TIER 3 — `nerlo_cli/main.py`, which was at 0%                                #
 # --------------------------------------------------------------------------- #
