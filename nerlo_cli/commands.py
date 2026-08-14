@@ -311,9 +311,48 @@ def info(skill_name: str, api_url: str, as_json: bool) -> None:
 
 
 def _resolve_skill(client: httpx.Client, skill_name: str) -> dict[str, Any]:
-    response = _request(client, "GET", f"/api/v1/skills/{skill_name}")
+    response = _request(client, "GET", f"/api/v1/skills/{skill_name}", fatal=False)
     if response.status_code == 200:
         return response.json()
+
+    # Fallback 1: Direct UUID lookup on /api/v1/servers/{id}
+    try:
+        uuid_mod.UUID(skill_name)
+        is_uuid = True
+    except ValueError:
+        is_uuid = False
+
+    if is_uuid:
+        server_resp = _request(client, "GET", f"/api/v1/servers/{skill_name}", fatal=False)
+        if server_resp.status_code == 200:
+            srv = server_resp.json()
+            return {
+                "skill_id": srv.get("id"),
+                "name": srv.get("name"),
+                "repository_url": srv.get("repository_url"),
+                "artifact_type": srv.get("artifact_type"),
+                "current_badge": srv.get("composite_badge"),
+                "current_security_score": srv.get("composite_score"),
+                "mcp_server_id": srv.get("id"),
+            }
+
+    # Fallback 2: Name match on /api/v1/servers search
+    search_resp = _request(
+        client, "GET", "/api/v1/servers", params={"q": skill_name, "page_size": 10}, fatal=False
+    )
+    if search_resp.status_code == 200:
+        for item in search_resp.json().get("results", []):
+            if item.get("name") == skill_name or str(item.get("id")) == skill_name:
+                return {
+                    "skill_id": item.get("id"),
+                    "name": item.get("name"),
+                    "repository_url": item.get("repository_url"),
+                    "artifact_type": item.get("artifact_type"),
+                    "current_badge": item.get("current_badge"),
+                    "current_security_score": item.get("current_security_score"),
+                    "mcp_server_id": item.get("id"),
+                }
+
     if response.status_code in (404, 422):
         _fail(f"skill not found: {skill_name!r} (Req 11.12)")
     _fail(f"lookup failed (HTTP {response.status_code})")
