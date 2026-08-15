@@ -1,6 +1,12 @@
 [project]
 name = "nerlo"
-version = "0.2.0"
+# 0.3.0: the badge vocabulary change. A MINOR bump, not a patch, because the
+# words every command prints are different — and not a MAJOR one, because the
+# machine contract (`--json` `status`/`badge`/`summary`, the `--fail-on` tokens,
+# the exit codes) is byte-identical to 0.2.0 by design. Merging this does not
+# ship it: `publish.yml` fires on `release: published`, so a GitHub Release
+# against this version is what reaches PyPI.
+version = "0.3.0"
 description = "Nerlo CLI — search, inspect, and install MCP servers from the Nerlo security registry"
 readme = "README.md"
 requires-python = ">=3.11"

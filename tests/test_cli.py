@@ -10,8 +10,11 @@ without a live API.
 Covers:
   * argument validation — malformed submit URL, out-of-range search query,
     unknown `--target` platform
-  * badge-based install gating (Req 11.2) — Unsafe refused, no-badge refused,
-    Caution prompts, Verified proceeds and writes the mcpServers entry
+  * badge-based install gating (Req 11.2) — a Flagged badge is refused, an
+    Unrated artifact is refused, Caution prompts, and a Clean badge proceeds
+    and writes the mcpServers entry. The handlers serve the WIRE badges
+    (`Unsafe`/`Caution`/`Verified`) because that is what the API sends; the
+    assertions are on the DISPLAY words, which is the split under test
   * `--json` machine output
   * authentication handling (Req 11.10) — missing token refused before any
     network call; a 401/403 from the API aborts with no action taken
@@ -151,10 +154,12 @@ def _skill_handler(
 
 
 def test_install_refuses_unsafe_badge(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The handler still serves the WIRE badge `Unsafe` — that is what the API
+    # sends and what the gate compares against. Only the printed word changed.
     _use_handler(monkeypatch, _skill_handler("Unsafe"))
     result = CliRunner().invoke(commands.install, ["demo", "--target", "mcp", "--token", "t"])
     assert result.exit_code == 1
-    assert "Unsafe badge" in _combined(result)
+    assert "Flagged badge" in _combined(result)
 
 
 def test_install_refuses_unbadged_skill(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -728,7 +733,7 @@ def test_install_claude_skill_honours_badge_gate(
         commands.install, ["demo", "--target", "claude-code", "--token", "t"]
     )
     assert result.exit_code == 1
-    assert "Unsafe badge" in _combined(result)
+    assert "Flagged badge" in _combined(result)
     assert not (home / ".claude").exists()
 
 
@@ -901,7 +906,8 @@ def test_check_unknown_is_not_rendered_as_a_pass(
     result = CliRunner().invoke(commands.check, [str(root)])
     combined = _combined(result)
     assert "UNKNOWN" in combined
-    assert "VERIFIED" not in combined
+    assert "CLEAN" not in combined
+    assert "VERIFIED" not in combined  # the retired word, gone from output entirely
     assert "NOT in the Nerlo registry listing" in combined
     assert "Unknown is not safe" in combined
     assert "nerlo submit" in combined  # the submission funnel
@@ -1562,7 +1568,7 @@ def test_check_non_numeric_score_does_not_manufacture_a_verdict(
     result = CliRunner().invoke(commands.check, [str(root)])
     assert result.exception is None, result.exception
     assert result.exit_code == 0
-    assert "VERIFIED" in _combined(result)
+    assert "CLEAN" in _combined(result)
     payload = _json_payload(
         CliRunner().invoke(commands.check, [str(root), "--json"]),
     )

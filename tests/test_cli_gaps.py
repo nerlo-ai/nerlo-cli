@@ -732,7 +732,12 @@ def test_build_mcp_entry_does_not_make_a_lookalike_host_runnable(repo: str) -> N
     """Suffix matching here would let `evilnpmjs.com` mint `npx -y pwn`."""
     entry = commands._build_mcp_entry({"repository_url": repo, "current_badge": "Verified"})
     assert "command" not in entry
-    assert entry == {"repository": repo, "nerlo_badge": "Verified"}
+    # The wire badge is preserved verbatim; the display label rides alongside it.
+    assert entry == {
+        "repository": repo,
+        "nerlo_badge": "Verified",
+        "nerlo_badge_label": "Clean",
+    }
 
 
 @pytest.mark.parametrize(
@@ -766,7 +771,11 @@ def test_build_mcp_entry_makes_real_registry_hosts_runnable(
 )
 def test_build_mcp_entry_falls_back_to_a_repository_reference(repo: str) -> None:
     entry = commands._build_mcp_entry({"repository_url": repo, "current_badge": "Verified"})
-    assert entry == {"repository": repo, "nerlo_badge": "Verified"}
+    assert entry == {
+        "repository": repo,
+        "nerlo_badge": "Verified",
+        "nerlo_badge_label": "Clean",
+    }
 
 
 def test_install_from_a_non_package_source_warns_that_wiring_is_unfinished(
@@ -783,7 +792,11 @@ def test_install_from_a_non_package_source_warns_that_wiring_is_unfinished(
     assert result.exit_code == 0, _combined(result)
     assert "no runnable package source detected" in _combined(result)
     entry = json.loads(config.read_text(encoding="utf-8"))["mcpServers"]["demo-skill"]
-    assert entry == {"repository": "https://github.com/o/r", "nerlo_badge": "Verified"}
+    assert entry == {
+        "repository": "https://github.com/o/r",
+        "nerlo_badge": "Verified",
+        "nerlo_badge_label": "Clean",
+    }
 
 
 def test_install_json_shape_for_an_mcp_server(
@@ -1523,9 +1536,22 @@ def test_check_renders_an_unscannable_reason(
     assert artifact["note"] == "repository is archived"
 
 
-@pytest.mark.parametrize("score", [["not", "a", "number"], {"v": 1}, "N/A", None])
+@pytest.mark.parametrize(
+    ("score", "expected_label"),
+    [
+        (["not", "a", "number"], "CLEAN"),
+        ({"v": 1}, "CLEAN"),
+        ("N/A", "CLEAN"),
+        # An ABSENT score beside a present badge is the halt case, and it is the
+        # one member of this set that is not an unreadable-score case at all.
+        # `_coerce_score` returns None for both, which is exactly why the halt
+        # test reads the RAW field instead — see `HALTED_LABEL`. Calling a
+        # garbled score a halt would invent a stop that never happened.
+        (None, "SCAN HALTED"),
+    ],
+)
 def test_check_unreadable_score_renders_as_a_dash_not_a_verdict(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, score: Any
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, score: Any, expected_label: str
 ) -> None:
     """`_coerce_score`'s non-scalar arm. The BADGE decides the gate; a score
     field we could not parse must neither crash the renderer (which the
@@ -1554,7 +1580,7 @@ def test_check_unreadable_score_renders_as_a_dash_not_a_verdict(
     result = CliRunner().invoke(commands.check, [str(project)])
     assert result.exit_code == 0, _combined(result)
     assert "PASS" in result.output
-    assert "VERIFIED" in result.output
+    assert expected_label in result.output
 
 
 @pytest.mark.parametrize(
@@ -1580,7 +1606,7 @@ def test_check_config_of_the_wrong_shape_is_incomplete_not_empty(
     combined = _combined(result)
     assert "could not read config" in combined
     assert "ValueError" in combined
-    assert "Nothing was verified" in combined
+    assert "Nothing was checked" in combined
     assert "nothing to check" not in combined
 
 
@@ -1605,8 +1631,8 @@ def test_check_zero_artifacts_from_unreadable_configs_says_READ_not_CONFIGURED(
     """The all-unreadable headline must say "could be READ", never "configured".
 
     Found by mutation, 2026-08-13 PT. The existing coverage of this branch pins
-    the tail of the message ("Nothing was verified", `grep -n 'Nothing was
-    verified' tests/test_cli_gaps.py`) and the exit code, but nothing pinned the
+    the tail of the message ("Nothing was checked", `grep -n 'Nothing was
+    checked' tests/test_cli_gaps.py`) and the exit code, but nothing pinned the
     HEADLINE. Substituting
 
         "No AI artifacts could be read in {scope}: ..."
@@ -1950,3 +1976,193 @@ def test_logger_event_without_fields_has_no_trailing_space(
     # space before the newline), and a bare "\n" is the one thing that could
     # legitimately differ per OS in a captured text stream.
     assert capsys.readouterr().err.replace("\r\n", "\n") == "[error] cli.check\n"
+
+
+# --------------------------------------------------------------------------- #
+# the badge vocabulary: display words changed, wire values and typed tokens    #
+# did not. Three audiences, three contracts — see the module docstring of      #
+# `nerlo_cli.commands`.                                                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_no_command_help_prints_a_retired_word() -> None:
+    """THE HEADLINE CLAIM, as a mechanism rather than an intention.
+
+    Every command's rendered `--help`, plus the group's, must be free of both
+    retired words in every casing. Driven through Click rather than grepped out
+    of the source, because a word can reach the screen from a `click.Choice`, a
+    metavar or a default without ever appearing as a string literal — which is
+    exactly how `--fail-on`'s choice list would have kept printing `unsafe`
+    after every literal in the file had been changed.
+    """
+    runner = CliRunner()
+    targets: list[tuple[str, Any]] = [("nerlo", main.cli)]
+    targets += [(c.name or "?", c) for c in commands.ALL_COMMANDS]
+
+    offenders: list[str] = []
+    for name, command in targets:
+        result = runner.invoke(command, ["--help"])
+        assert result.exit_code == 0, f"{name} --help failed: {result.output}"
+        lowered = result.output.lower()
+        offenders += [f"{name} --help: {w}" for w in ("unsafe", "verified") if w in lowered]
+    assert not offenders, offenders
+
+    # POSITIVE CONTROL for the assertion above: the same grep, over the same
+    # rendered text, DOES fire on a word that is genuinely there. Without this,
+    # a `--help` that silently stopped rendering (or an invoke that returned
+    # empty) would pass the check by having no text at all.
+    assert "caution" in runner.invoke(commands.check, ["--help"]).output.lower()
+
+
+def test_fail_on_accepts_the_retired_token_and_the_new_one_identically(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--fail-on unsafe` is in users' committed workflow files. It keeps working.
+
+    The two spellings must be indistinguishable in every observable: exit code,
+    and the `fail_on` the JSON reports back. Only `--help` distinguishes them,
+    by documenting one and not the other.
+    """
+    project = _project_with(tmp_path, {"demo": {"command": "npx", "args": ["-y", "demo"]}})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/servers":
+            return _json_response(
+                request,
+                200,
+                {"results": [{"id": "srv-1", "name": "demo"}], "total_count": 1, "total_pages": 1},
+            )
+        return _json_response(
+            request,
+            200,
+            {
+                "id": "srv-1",
+                "name": "demo",
+                "composite_badge": "Unsafe",
+                "composite_score": 12.0,
+            },
+        )
+
+    payloads = []
+    for token in ("unsafe", "flagged"):
+        _use_handler(monkeypatch, handler)
+        result = CliRunner().invoke(commands.check, [str(project), "--fail-on", token, "--json"])
+        assert result.exit_code == 1, f"--fail-on {token} did not fail a flagged artifact"
+        payloads.append(_json_payload(result))
+
+    assert payloads[0] == payloads[1]
+    # And the wire token is what comes back, whichever was typed — a pipeline
+    # comparing `fail_on == "unsafe"` is unaffected by a user retyping the flag.
+    assert payloads[0]["fail_on"] == "unsafe"
+    assert payloads[0]["fail_on_label"] == "flagged"
+
+    # An unknown token is still a usage error (exit 2), and the message names
+    # only the documented spellings.
+    bad = CliRunner().invoke(commands.check, [str(project), "--fail-on", "nope"])
+    assert bad.exit_code == 2
+    assert "unsafe" not in bad.output.lower()
+
+
+def test_check_json_keeps_wire_values_and_adds_the_display_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The machine contract is untouched; the label is purely additive.
+
+    A halted artifact is the sharpest case: it DISPLAYS "Scan Halted" and its
+    `status` is still `unsafe`, so it still fails the gate. If a future edit
+    promoted the halt to a status of its own it would drop out of every
+    `--fail-on` set, and a scan that stopped on a critical finding would start
+    passing — a security regression wearing a vocabulary change as a disguise.
+    """
+    project = _project_with(tmp_path, {"demo": {"command": "npx", "args": ["-y", "demo"]}})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/servers":
+            return _json_response(
+                request,
+                200,
+                {"results": [{"id": "srv-1", "name": "demo"}], "total_count": 1, "total_pages": 1},
+            )
+        # Badge present, score ABSENT — the halt pairing.
+        return _json_response(
+            request, 200, {"id": "srv-1", "name": "demo", "composite_badge": "Unsafe"}
+        )
+
+    _use_handler(monkeypatch, handler)
+    result = CliRunner().invoke(commands.check, [str(project), "--json"])
+    assert result.exit_code == 1  # still a policy violation at the default level
+    payload = _json_payload(result)
+    artifact = payload["artifacts"][0]
+    assert artifact["status"] == "unsafe"  # WIRE — unchanged
+    assert artifact["badge"] == "Unsafe"  # WIRE — unchanged
+    assert artifact["status_label"] == "Scan Halted"  # DISPLAY — new, additive
+    assert payload["summary"]["unsafe"] == 1  # WIRE — summary keys unchanged
+
+    # The human render of the same run says the halt, not the flag.
+    _use_handler(monkeypatch, handler)
+    human = _combined(CliRunner().invoke(commands.check, [str(project)]))
+    assert "SCAN HALTED" in human
+    assert "FLAGGED" not in human
+
+
+def test_a_scored_bad_artifact_is_flagged_not_halted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Positive control for the halt test above: with a score present, the same
+    `Unsafe` wire badge renders FLAGGED. Without this, a `_display_label` that
+    returned "Scan Halted" unconditionally would pass every halt assertion."""
+    project = _project_with(tmp_path, {"demo": {"command": "npx", "args": ["-y", "demo"]}})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/servers":
+            return _json_response(
+                request,
+                200,
+                {"results": [{"id": "srv-1", "name": "demo"}], "total_count": 1, "total_pages": 1},
+            )
+        return _json_response(
+            request,
+            200,
+            {"id": "srv-1", "name": "demo", "composite_badge": "Unsafe", "composite_score": 41.0},
+        )
+
+    _use_handler(monkeypatch, handler)
+    human = _combined(CliRunner().invoke(commands.check, [str(project)]))
+    assert "FLAGGED" in human
+    assert "SCAN HALTED" not in human
+
+
+@pytest.mark.parametrize(
+    ("badge", "expected"),
+    [("Verified", "Clean"), ("Caution", "Caution"), ("Unsafe", "Flagged"), (None, "Unrated")],
+)
+def test_info_renders_the_display_vocabulary(
+    monkeypatch: pytest.MonkeyPatch, badge: str | None, expected: str
+) -> None:
+    """`info`'s badge line, across the whole vocabulary including the absent case.
+
+    The `None` row is not decoration: `_resolve_skill`'s UUID and search
+    fallbacks build a record whose `current_badge` key EXISTS and is null, which
+    the previous `.get('current_badge', '-')` rendered as the literal "None".
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/api/v1/skills/"):
+            return _json_response(
+                request,
+                200,
+                {
+                    "skill_id": "demo-skill",
+                    "name": "demo",
+                    "current_badge": badge,
+                    "current_security_score": 88.0,
+                    "repository_url": "https://github.com/o/r",
+                },
+            )
+        return _json_response(request, 404, {})
+
+    _use_handler(monkeypatch, handler)
+    result = CliRunner().invoke(commands.info, ["demo"])
+    assert result.exit_code == 0, _combined(result)
+    assert f"badge:      {expected}" in result.output
+    assert "None" not in result.output
