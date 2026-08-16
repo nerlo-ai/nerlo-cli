@@ -14,7 +14,7 @@ human-readable table.
 materialised via a shallow `git clone` of the repository) into
 `~/.claude/skills/<skill-slug>/`; `gemini_extension` is a placeholder (install
 path pending Google runtime API); `cursor_rule` is refused. All installs are
-badge gated: Verified proceeds, Caution prompts for confirmation, Unsafe
+badge gated: Clean proceeds, Caution prompts for confirmation, Flagged
 refuses. For npm-hosted packages the mcpServers entry is runnable
 (`npx -y <package>`); for other sources the entry records the repository and
 the user finishes the command wiring — Nerlo verifies code, it does not (yet)
@@ -28,7 +28,40 @@ why a listing miss is reported as its own outcome rather than as a pass.
 
 The governing invariant of `check`, which every status and exit code below
 serves: AN UNRESOLVED ARTIFACT MUST NEVER BE INDISTINGUISHABLE FROM AN ABSENT
-ONE, and neither may pass a gate whose whole purpose is to fail on Unsafe.
+ONE, and neither may pass a gate whose whole purpose is to fail on a flagged
+artifact.
+
+THE VOCABULARY IS THREE THINGS, NOT ONE — DO NOT "SIMPLIFY" THIS BACK
+========================================================================
+The registry's badge has a wire spelling and a display spelling, and this CLI
+additionally lets a user TYPE one at `--fail-on`. Those are three different
+audiences with three different compatibility stories, so they are three
+different values and must stay that way:
+
+  1. WIRE — `"Verified"` / `"Caution"` / `"Unsafe"` in the API, and the
+     lowercase `verified` / `caution` / `unsafe` in `--json`'s `status` field
+     and `summary` keys. THESE DO NOT CHANGE. CI pipelines parse them today;
+     renaming them strands every existing consumer mid-run. Every comparison in
+     this module (`badge == "Unsafe"`, `_status_from_record`) keys on the wire
+     value and nothing else.
+  2. DISPLAY — what a human reads: `Clean` / `Caution` / `Flagged`, plus
+     `Unrated` for an absent badge and `Scan Halted` for the badge-present /
+     score-absent pairing. Produced ONLY by `badge_label_or_unrated`,
+     `verdict_label` and `STATUS_LABELS`. Never send one of these anywhere.
+  3. TYPED TOKENS — the `--fail-on` words. Both vocabularies are accepted
+     (`flagged` and `unsafe` both mean the same level); only the new one is
+     documented in `--help`. The old one keeps working silently and
+     permanently, because a user's `.github/workflows/*.yml` is not something
+     we get to break.
+
+WHY THE DISPLAY WORDS CHANGED. "Unsafe" does not mean unsafe — it means "at
+least one scanner of eight-to-eleven scored below 60", which at measurement sat
+on ~90% of badged artifacts, most of them scoring well. "Verified" fails the
+other way: Nerlo verifies nothing, it runs tools and publishes what they said.
+"Caution" is unchanged and deliberately so — it is advice to a reader rather
+than an assertion about someone's code. The canonical copy of this table is the
+registry's own `web/src/lib/badge-label.ts`; this module is the CLI's twin of
+it, and if the two ever disagree the registry's is the behaviour that wins.
 """
 
 import contextlib
@@ -204,6 +237,60 @@ def _table(rows: list[dict[str, Any]], columns: list[str]) -> None:
 
 
 # --------------------------------------------------------------------- #
+# BADGE DISPLAY LABELS — item 2 of the three-way split in the module        #
+# docstring. Read that first if you are here to change something.          #
+# --------------------------------------------------------------------- #
+
+#: Wire badge value -> the word a human reads. The keys are the API's spelling
+#: and are the ONLY thing this module ever compares against; the values never
+#: travel anywhere. Mirrors `BADGE_LABELS` in the registry's badge-label.ts.
+BADGE_LABELS: dict[str, str] = {
+    "Verified": "Clean",
+    "Caution": "Caution",
+    "Unsafe": "Flagged",
+}
+#: No badge recorded. Never a grade and never a zero — an artifact nobody has
+#: rated is not thereby a bad one, nor a good one.
+UNRATED_LABEL = "Unrated"
+#: A scan that stopped on a critical finding before the later phases ran. On the
+#: wire this is the pairing "badge present, score ABSENT", and it is a DIFFERENT
+#: CLAIM from "the scanners disagreed" — most rows carrying the `Unsafe` wire
+#: badge are this case rather than the other one, which is precisely why
+#: rendering them all as "Flagged" would be the conflation this vocabulary
+#: exists to undo. "Absent" means the field was null/missing, NOT that it was
+#: present and unparseable; `_coerce_score` collapses those two and callers
+#: therefore test the RAW value, not its coercion.
+HALTED_LABEL = "Scan Halted"
+
+
+def badge_label_or_unrated(badge: Any) -> str:
+    """The word to SHOW for a badge that may be absent. Never send it onward.
+
+    An unrecognised badge string (one a future API grows) falls through to
+    `UNRATED_LABEL` rather than being echoed raw: this function's whole job is
+    that no wire spelling reaches a human, and a passthrough would defeat it
+    for exactly the values nobody has reviewed.
+    """
+    if badge is None:
+        return UNRATED_LABEL
+    return BADGE_LABELS.get(str(badge), UNRATED_LABEL)
+
+
+def verdict_label(badge: Any, raw_score: Any) -> str:
+    """Full display state for a (badge, score) pair, halt case included.
+
+    `raw_score` is the score EXACTLY as the API handed it over — do not pass a
+    coerced float, because `None` out of `_coerce_score` also means "present but
+    unreadable", and calling that a halt would invent a stop that never
+    happened. Halt is resolved before the badge lookup, mirroring the registry's
+    own `TrustBadge`.
+    """
+    if badge is not None and raw_score is None:
+        return HALTED_LABEL
+    return badge_label_or_unrated(badge)
+
+
+# --------------------------------------------------------------------- #
 # nerlo search (Req 11.3, 11.4)                                            #
 # --------------------------------------------------------------------- #
 
@@ -238,7 +325,10 @@ def search(query: str, api_url: str, as_json: bool) -> None:
                 # Ticket 33.9: surface the artifact type alongside every result.
                 "type": r.get("artifact_type"),
                 "score": r.get("current_security_score"),
-                "badge": r.get("current_badge"),
+                # DISPLAY label, not the wire badge. `--json` above returns the
+                # API rows untouched, so a machine consumer still gets
+                # `current_badge` verbatim.
+                "badge": verdict_label(r.get("current_badge"), r.get("current_security_score")),
                 "author": r.get("author"),
                 "id": r.get("id"),
             }
@@ -280,8 +370,15 @@ def info(skill_name: str, api_url: str, as_json: bool) -> None:
     # Ticket 33.9: artifact type is part of the human summary (and the raw
     # `--json` skill object already carries it through unmodified).
     click.echo(f"  type:       {skill.get('artifact_type') or '-'}")
-    click.echo(f"  badge:      {skill.get('current_badge', '-')}")
-    click.echo(f"  score:      {skill.get('current_security_score', '-')}")
+    # DISPLAY labels. `--json` above hands back the API objects unmodified, so
+    # `current_badge` is still available verbatim to anything parsing this.
+    # Both lines read the RAW score: an absent one beside a present badge is the
+    # halt case, and `.get(key, '-')` cannot see that — it returns the stored
+    # `None` (rendering the literal "None") whenever the key exists and is null,
+    # which `_resolve_skill`'s UUID and search fallbacks both produce.
+    raw_score = skill.get("current_security_score")
+    click.echo(f"  badge:      {verdict_label(skill.get('current_badge'), raw_score)}")
+    click.echo(f"  score:      {'-' if raw_score is None else raw_score}")
     if install_stats is not None:
         total = install_stats.get("total", 0)
         last_30d = install_stats.get("last_30d", 0)
@@ -301,7 +398,12 @@ def info(skill_name: str, api_url: str, as_json: bool) -> None:
                 {
                     "scanner": s.get("scanner_name") or s.get("tool_name"),
                     "score": s.get("score"),
-                    "badge": s.get("badge"),
+                    # `badge_label_or_unrated`, not `verdict_label`: halting is
+                    # a JOB-level event, so "Scan Halted" is a statement about
+                    # the artifact's scan and not about one scanner's opinion.
+                    # A per-scanner row with no score is a scanner that did not
+                    # score, which is Unrated.
+                    "badge": badge_label_or_unrated(s.get("badge")),
                     "findings": len(s.get("findings", [])),
                 }
                 for s in scanner_reports
@@ -553,7 +655,10 @@ def install(
     token: str | None,
     as_json: bool,
 ) -> None:
-    """Install a verified skill, routed by its artifact type.
+    """Install a registry-listed skill, routed by its artifact type.
+
+    Badge gated: a Clean badge installs, Caution prompts for confirmation, a
+    Flagged badge is refused, and an Unrated artifact is not installable.
 
     mcp_server artifacts get an mcpServers config entry (runnable for
     npm/PyPI-hosted packages; a repository reference otherwise — finish
@@ -614,9 +719,12 @@ def install(
         )
 
     badge = skill.get("current_badge")
-    # Req 11.2 badge gate.
+    # Req 11.2 badge gate. EVERY COMPARISON HERE IS AGAINST THE WIRE VALUE and
+    # must stay that way — the display words below come out of `BADGE_LABELS`
+    # and are never compared against. Swapping a comparison to a label would
+    # make the gate stop matching what the API actually sends.
     if badge == "Unsafe":
-        _fail(f"{skill_name!r} carries an Unsafe badge — installation refused")
+        _fail(f"{skill_name!r} carries a Flagged badge — installation refused")
     if badge == "Caution":
         click.secho(
             f"WARNING: {skill_name!r} carries a Caution badge — its scan "
@@ -627,7 +735,14 @@ def install(
             click.echo("Aborted.")
             sys.exit(1)
     elif badge != "Verified":
-        _fail(f"{skill_name!r} has no badge yet (status: {badge!r}) — not installable")
+        # Unreachable for the three known badges (each is handled above), so
+        # the raw value echoed here can never be one of them. It is labelled as
+        # a registry value because that is what it is: an unrecognised wire
+        # string is worth showing verbatim when someone has to report it.
+        _fail(
+            f"{skill_name!r} is Unrated — it has no badge yet "
+            f"(registry value: {badge!r}) — not installable"
+        )
 
     if artifact_type == "claude_skill":
         # Ticket 33.9: copy-install the skill directory into
@@ -704,7 +819,19 @@ def _build_mcp_entry(skill: dict[str, Any]) -> dict[str, Any]:
         package = urlparse(repo).path.split("/project/")[-1].strip("/")
         if package:
             return {"command": "uvx", "args": [package]}
-    return {"repository": repo, "nerlo_badge": skill.get("current_badge")}
+    # `nerlo_badge` keeps the WIRE value — it is a record written into a
+    # machine-readable config, in the same class as `--json`, and nothing should
+    # have to re-map it to compare against the API. `nerlo_badge_label` is its
+    # display sibling, because this file is also one a human opens: it is the
+    # only place the vocabulary would otherwise be missing. Neither key is read
+    # back by `check` (which resolves on `repository` / `command`), so adding
+    # one cannot change discovery.
+    badge = skill.get("current_badge")
+    return {
+        "repository": repo,
+        "nerlo_badge": badge,
+        "nerlo_badge_label": badge_label_or_unrated(badge),
+    }
 
 
 def _write_mcp_entry(
@@ -956,11 +1083,17 @@ def rescan(identifier: str, api_url: str, token: str | None, as_json: bool) -> N
 # somebody remembers, a non-zero exit blocks the merge whether anybody
 # remembered or not.
 
-# The outcomes `check` reports. These are deliberately NOT collapsible into a
-# pass/fail boolean, because three of them are different facts:
-#   verified  — in the registry, aggregate verdict Verified
-#   caution   — in the registry, aggregate verdict Caution
-#   unsafe    — in the registry, aggregate verdict Unsafe
+# The outcomes `check` reports. THESE STRINGS ARE WIRE VALUES: they are what
+# `--json` puts in `status` and in the `summary` keys, and CI parses them. The
+# words a human sees come from `STATUS_LABELS` further down and are a separate
+# table on purpose — see the three-way split in the module docstring.
+#
+# They are deliberately NOT collapsible into a pass/fail boolean, because three
+# of them are different facts (display label in brackets):
+#   verified  — in the registry, aggregate verdict `Verified`   [Clean]
+#   caution   — in the registry, aggregate verdict `Caution`    [Caution]
+#   unsafe    — in the registry, aggregate verdict `Unsafe`     [Flagged, or
+#               Scan Halted when the score is absent — see HALTED_LABEL]
 #   withheld  — in the registry, and the registry is REFUSING to publish an
 #               aggregate verdict (`aggregate_verdict_withheld`). Live data
 #               shows this is common; it means coverage was insufficient.
@@ -995,6 +1128,29 @@ STATUS_UNKNOWN = "unknown"
 STATUS_UNRESOLVED = "unresolved"
 STATUS_ERROR = "error"
 
+# Status wire value -> the words a human reads. Only two entries differ from
+# their key, and they are the two the vocabulary change is about; the rest are
+# here so that ONE table produces every rendered status and none can be missed
+# by a future edit that touches only the interesting ones.
+STATUS_LABELS: dict[str, str] = {
+    STATUS_VERIFIED: BADGE_LABELS["Verified"],
+    STATUS_CAUTION: BADGE_LABELS["Caution"],
+    STATUS_UNSAFE: BADGE_LABELS["Unsafe"],
+    STATUS_WITHHELD: "Withheld",
+    STATUS_UNSCORED: "Unscored",
+    STATUS_UNKNOWN: "Unknown",
+    STATUS_UNRESOLVED: "Unresolved",
+    STATUS_ERROR: "Error",
+}
+# The statuses that were read off a BADGE, and so are the only ones the halt
+# case can apply to. `withheld` is excluded because `_status_from_record`
+# resolves it before it ever looks at a badge: "the registry declines to vouch"
+# is a stronger and more specific statement than "the scan stopped", and
+# overwriting it with the halt label would lose the reason the registry gave.
+_BADGE_DERIVED_STATUSES: frozenset[str] = frozenset(
+    {STATUS_VERIFIED, STATUS_CAUTION, STATUS_UNSAFE}
+)
+
 # Exit codes. THIS IS THE CONTRACT — CI reads it, humans read the table.
 #   0  every discovered artifact satisfied the policy (including "nothing
 #      installed", which is a legitimate pass)
@@ -1004,7 +1160,7 @@ STATUS_ERROR = "error"
 #      artifact (registry unreachable, bad response, unparseable local config,
 #      or a search too broad to read to the end) and found no outright
 #      violation. A check that could not reach the registry has NOT passed.
-# Violation outranks incomplete: if we already know something is Unsafe, exit 1
+# Violation outranks incomplete: if we already know something is flagged, exit 1
 # is the more actionable signal, and the incomplete rows are still printed.
 EXIT_OK = 0
 EXIT_POLICY_VIOLATION = 1
@@ -1023,15 +1179,19 @@ EXIT_INCOMPLETE = 3
 #
 # `any` DOES include unknown (and withheld, and unscored). That is the whole
 # point of the strict level: it means "fail unless the registry affirmatively
-# verified this", which is the correct policy once a team has submitted its
+# rated this clean", which is the correct policy once a team has submitted its
 # dependency set and wants to keep it that way. Choosing `any` is choosing to
 # treat absence of evidence as failure — available, not default.
 #
 # THE LADDER IS MONOTONIC and `test_fail_on_ladder_is_monotonic` pins it: each
 # level is a superset of the one before, so raising --fail-on can only ever add
 # failures. Narrowing `caution` to just {caution} would let a laxer-sounding
-# level miss an Unsafe artifact that the stricter-sounding level catches, which
+# level miss a flagged artifact that the stricter-sounding level catches, which
 # is a gate that lies about its own severity ordering.
+#
+# THE KEYS ARE WIRE TOKENS. They are what `--json` reports back in `fail_on`,
+# and they keep their original spelling for the same reason `status` does. What
+# a user TYPES is a separate, wider vocabulary — see `FAIL_ON_TOKENS`.
 FAIL_ON_STATUSES: dict[str, frozenset[str]] = {
     "unsafe": frozenset({STATUS_UNSAFE}),
     "caution": frozenset({STATUS_UNSAFE, STATUS_CAUTION}),
@@ -1039,6 +1199,49 @@ FAIL_ON_STATUSES: dict[str, frozenset[str]] = {
         {STATUS_UNSAFE, STATUS_CAUTION, STATUS_WITHHELD, STATUS_UNSCORED, STATUS_UNKNOWN}
     ),
 }
+
+# Item 3 of the three-way split: the words a user may TYPE at `--fail-on`.
+#
+# `flagged` and `unsafe` are the SAME LEVEL and both are permanently accepted.
+# Only `flagged` is documented, because `unsafe` is the word we are retiring;
+# but removing it would break every `--fail-on unsafe` already committed to
+# somebody's workflow file, and a security gate that fails closed on its own
+# CLI upgrade is a gate people rip out. So: new word in the help, old word
+# still works, no deprecation warning to spam a build log with.
+FAIL_ON_TOKENS: dict[str, str] = {
+    "any": "any",
+    "caution": "caution",
+    "flagged": "unsafe",
+    "unsafe": "unsafe",  # retired spelling, still accepted — do not remove
+}
+#: The tokens `--help` advertises. Deliberately a subset of `FAIL_ON_TOKENS`.
+FAIL_ON_DOCUMENTED: tuple[str, ...] = ("any", "caution", "flagged")
+#: Canonical level -> the word to print when a human is told which level ran.
+FAIL_ON_LABELS: dict[str, str] = {"unsafe": "flagged", "caution": "caution", "any": "any"}
+
+
+class _FailOnLevel(click.ParamType):
+    """`--fail-on`, accepting both vocabularies and normalising to the wire one.
+
+    Not a `click.Choice`, and that is the entire point: `Choice` renders every
+    accepted value into `--help`, so keeping `unsafe` working would also keep it
+    printed. This type accepts the wider set and advertises the narrower one.
+    """
+
+    name = "level"
+
+    def get_metavar(self, param: click.Parameter, ctx: click.Context | None = None) -> str:
+        # `ctx` is positional in Click >= 8.2 and absent in 8.1; defaulted so
+        # both call shapes work, since pyproject only floors at click>=8.1.
+        return "[" + "|".join(FAIL_ON_DOCUMENTED) + "]"
+
+    def convert(self, value: Any, param: click.Parameter | None, ctx: click.Context | None) -> str:
+        level = FAIL_ON_TOKENS.get(str(value).strip().lower())
+        if level is None:
+            self.fail(f"{value!r} is not one of {', '.join(FAIL_ON_DOCUMENTED)}.", param, ctx)
+        return level
+
+
 # Statuses that mean "we did not get an answer", as opposed to "the answer was
 # bad". These drive EXIT_INCOMPLETE and are deliberately in NONE of the
 # FAIL_ON_STATUSES sets above: "we could not ask" is never a policy verdict —
@@ -1065,7 +1268,7 @@ _PACKAGE_RUNNERS: dict[str, frozenset[str]] = {
 # `_PACKAGE_RUNNERS.get("npx.cmd") -> None`: `check` could not name the package,
 # resolved the entry by its user-chosen config key alone, found no match, and
 # reported a registry-listed artifact as `unknown`. `unknown` does not fail
-# `--fail-on unsafe`, so a Windows gate silently degraded — the same
+# `--fail-on flagged`, so a Windows gate silently degraded — the same
 # "could-not-determine renders as fine" shape this module exists to prevent,
 # reached through the platform instead of through the network.
 #
@@ -1100,6 +1303,13 @@ class _Checked:
     scanners: int | None = None
     note: str = ""
     duplicates: int = 0
+    #: Badge present, score ABSENT — the scan stopped before it produced one.
+    #: Display-only: the `status` beside it is unchanged and still decides the
+    #: gate, so a halted artifact fails exactly the levels it always did. This
+    #: is a flag rather than a ninth status precisely so it CANNOT change the
+    #: exit code; a halt that stopped failing `--fail-on` would be a security
+    #: regression wearing a vocabulary change as a disguise.
+    halted: bool = False
 
 
 def _normalise_repo(url: str) -> str:
@@ -1125,8 +1335,8 @@ def _package_from_command(command: str, args: Any) -> str | None:
     Inverse of `_build_mcp_entry`: `{"command": "npx", "args": ["-y", pkg]}`
     -> `pkg`. Returns None for `node server.js`, `docker run ...` and anything
     else whose first argument is not a package — guessing there would invent an
-    identity, and a wrong identity resolving to some other project's Verified
-    badge is worse than reporting the entry under its config key alone.
+    identity, and a wrong identity resolving to the badge some OTHER project
+    earned is worse than reporting the entry under its config key alone.
     """
     runner = Path(str(command or "")).name.lower()
     for suffix in _RUNNER_EXECUTABLE_SUFFIXES:
@@ -1363,7 +1573,7 @@ def _discover(project: Path | None) -> tuple[list[_Discovered], list[str]]:
 # Rank used ONLY to pick which row wins when the registry holds several exact
 # matches for one local artifact (duplicate submissions are real — live data
 # shows repeated names). Lower wins, so a definite bad verdict always beats a
-# Verified duplicate: a security gate must never let a duplicate row launder a
+# clean duplicate: a security gate must never let a duplicate row launder a
 # bad verdict into a pass.
 _MATCH_PREFERENCE: dict[str, int] = {
     STATUS_UNSAFE: 0,
@@ -1430,7 +1640,7 @@ def _status_from_record(record: dict[str, Any]) -> str:
     if badge == "Verified":
         return STATUS_VERIFIED
     # Anything else — null, or a badge string a future API grows that this CLI
-    # has never heard of — is NOT verified. Unrecognised must fail closed.
+    # has never heard of — is NOT a clean verdict. Unrecognised must fail closed.
     return STATUS_UNSCORED
 
 
@@ -1439,8 +1649,8 @@ def _match_rows(rows: list[Any], found: _Discovered) -> list[dict[str, Any]]:
 
     The registry's `q=` is a fuzzy search — querying "server" returns
     "@4everland/hosting-mcp". Accepting a fuzzy hit would attach some other
-    project's Verified badge to an unknown local artifact, which is the same
-    collapse as scoring an unknown green. Only exact identity counts; anything
+    the badge some OTHER project earned to an unknown local artifact, which is
+    the same collapse as scoring an unknown green. Only exact identity counts; anything
     else stays `unknown`.
     """
     matched: list[dict[str, Any]] = []
@@ -1459,10 +1669,10 @@ def _match_rows(rows: list[Any], found: _Discovered) -> list[dict[str, Any]]:
 #
 # THE BUG THIS EXISTS TO KILL: reading page 1 and reporting a miss as "not in
 # registry". Live, a config entry named `app` produced exactly that — the
-# registry holds EIGHT rows named exactly `app`, every one of them Unsafe, and
-# at page_size=50 all eight sit on page 2 of 16. One page, no match, "not in
-# registry", EXIT 0. A known-Unsafe artifact walked through the gate whose only
-# job is to stop known-Unsafe artifacts.
+# registry holds EIGHT rows named exactly `app`, every one of them carrying the
+# `Unsafe` wire badge, and at page_size=50 all eight sit on page 2 of 16. One
+# page, no match, "not in registry", EXIT 0. A known-bad artifact walked through
+# the gate whose only job is to stop known-bad artifacts.
 #
 # CHECK_PAGE_SIZE is the API's documented maximum (openapi: page_size <= 100).
 # CHECK_MAX_PAGES bounds the read at 1000 rows per term, which at the registry's
@@ -1559,7 +1769,7 @@ def _resolve_one(
     # STATUS_UNKNOWN: "not in the registry listing". That is a claim about a
     # search that was never issued (proved with a recording transport:
     # QUERIES ISSUED: []), and STATUS_UNKNOWN does not fail the gate at
-    # `--fail-on unsafe`, so the artifact passes.
+    # `--fail-on flagged`, so the artifact passes.
     #
     # This is the SAME defect as the pagination one below, reached through the
     # term-length gate instead — the third distinct route to "could not
@@ -1618,7 +1828,7 @@ def _resolve_one(
     # lives on the detail endpoint (`composite_badge` + the scanner reports
     # that back it). Fetch it — and if that fetch fails, report `error` rather
     # than quietly falling back to the list row, because a silent fallback is
-    # how "we could not verify" turns into "verified".
+    # how "we could not verify" turns into a clean verdict.
     #
     # An id that is missing, or that carries path separators (which would let a
     # malformed response steer the request at another endpoint), is treated the
@@ -1657,29 +1867,26 @@ def _resolve_one(
         note = str(record.get("aggregate_verdict_withheld_reason") or "verdict withheld")
     elif record.get("unscannable_reason"):
         note = str(record["unscannable_reason"])
+    badge = _first_present(record, "composite_badge", "current_badge")
+    # The RAW score, before coercion. `_coerce_score` returns None for both
+    # "the field was null" and "the field was present but unreadable", and only
+    # the first of those is a halt — see HALTED_LABEL.
+    raw_score = _first_present(record, "composite_score", "current_security_score")
     return _Checked(
         found=found,
         status=status,
-        badge=_first_present(record, "composite_badge", "current_badge"),
-        score=_coerce_score(_first_present(record, "composite_score", "current_security_score")),
+        badge=badge,
+        score=_coerce_score(raw_score),
         server_id=server_id or None,
         scanners=len(reports) if isinstance(reports, list) else None,
         note=note,
         duplicates=len(matches) - 1,
+        halted=status in _BADGE_DERIVED_STATUSES and badge is not None and raw_score is None,
     )
 
 
-_STATUS_COLOURS: dict[str, str] = {
-    STATUS_UNSAFE: "red",
-    STATUS_CAUTION: "yellow",
-    STATUS_VERIFIED: "green",
-    STATUS_WITHHELD: "magenta",
-    STATUS_UNSCORED: "magenta",
-    STATUS_UNKNOWN: "magenta",
-    STATUS_UNRESOLVED: "red",
-    STATUS_ERROR: "red",
-}
-# Printed in this order so the things that matter are read first.
+# Printed in this order so the things that matter are read first. Also the key
+# set of `--json`'s `summary` object, which is why it is spelled in WIRE values.
 _SUMMARY_ORDER = (
     STATUS_UNSAFE,
     STATUS_CAUTION,
@@ -1692,6 +1899,40 @@ _SUMMARY_ORDER = (
 )
 
 
+def _display_label(checked: _Checked) -> str:
+    """The word to SHOW for one checked artifact. Never send it anywhere."""
+    return HALTED_LABEL if checked.halted else STATUS_LABELS[checked.status]
+
+
+# The human summary line tallies DISPLAY labels, not statuses, so that the
+# counts add up against the rows printed directly above them. A halted artifact
+# is one row saying "SCAN HALTED", so the summary must not call it a flagged
+# one — while `--json`'s `summary` keeps counting by status, because that is the
+# machine contract and the gate really does treat a halt as the status it has.
+_DISPLAY_ORDER: tuple[str, ...] = (
+    STATUS_LABELS[STATUS_UNSAFE],
+    HALTED_LABEL,
+    STATUS_LABELS[STATUS_CAUTION],
+    STATUS_LABELS[STATUS_WITHHELD],
+    STATUS_LABELS[STATUS_UNSCORED],
+    STATUS_LABELS[STATUS_UNKNOWN],
+    STATUS_LABELS[STATUS_UNRESOLVED],
+    STATUS_LABELS[STATUS_ERROR],
+    STATUS_LABELS[STATUS_VERIFIED],
+)
+_DISPLAY_COLOURS: dict[str, str] = {
+    STATUS_LABELS[STATUS_UNSAFE]: "red",
+    HALTED_LABEL: "red",
+    STATUS_LABELS[STATUS_CAUTION]: "yellow",
+    STATUS_LABELS[STATUS_WITHHELD]: "magenta",
+    STATUS_LABELS[STATUS_UNSCORED]: "magenta",
+    STATUS_LABELS[STATUS_UNKNOWN]: "magenta",
+    STATUS_LABELS[STATUS_UNRESOLVED]: "red",
+    STATUS_LABELS[STATUS_ERROR]: "red",
+    STATUS_LABELS[STATUS_VERIFIED]: "green",
+}
+
+
 @click.command()
 @click.argument(
     "path",
@@ -1701,8 +1942,11 @@ _SUMMARY_ORDER = (
 @click.option(
     "--fail-on",
     "fail_on",
-    type=click.Choice(sorted(FAIL_ON_STATUSES)),
-    default="unsafe",
+    type=_FailOnLevel(),
+    # The DOCUMENTED spelling of the unchanged default level. `_FailOnLevel`
+    # converts it to the wire token `unsafe` before the command body sees it,
+    # so `--json`'s `fail_on` is byte-identical to what it always was.
+    default="flagged",
     show_default=True,
     help="Exit non-zero at this severity or worse ('any' also fails on unknown).",
 )
@@ -1761,7 +2005,12 @@ def check(path: Path | None, fail_on: str, api_url: str, as_json: bool) -> None:
             {
                 "scope": scope,
                 "path": str(path) if path is not None else None,
+                # WIRE token, always — a caller that passed `--fail-on flagged`
+                # still reads back `unsafe` here, because this field is the one
+                # existing pipelines compare against. `fail_on_label` carries
+                # the documented spelling for anyone migrating.
                 "fail_on": fail_on,
+                "fail_on_label": FAIL_ON_LABELS[fail_on],
                 "exit_code": exit_code,
                 "summary": {"total": len(results), **counts},
                 "unreadable_configs": unreadable,
@@ -1771,7 +2020,13 @@ def check(path: Path | None, fail_on: str, api_url: str, as_json: bool) -> None:
                         "platform": r.found.platform,
                         "artifact_type": r.found.kind,
                         "source": r.found.source,
+                        # `status` and `badge` are WIRE values and do not
+                        # change — CI parses them. `status_label` is the new
+                        # sibling carrying the word the table prints, halt case
+                        # included, so a consumer can migrate its own output
+                        # without re-deriving the mapping.
                         "status": r.status,
+                        "status_label": _display_label(r),
                         "badge": r.badge,
                         "score": r.score,
                         "server_id": r.server_id,
@@ -1793,7 +2048,7 @@ def check(path: Path | None, fail_on: str, api_url: str, as_json: bool) -> None:
             click.secho(
                 f"No AI artifacts could be read in {scope}: "
                 f"{len(unreadable)} config(s) could not be parsed. "
-                "Nothing was verified.",
+                "Nothing was checked.",
                 fg="red",
                 bold=True,
             )
@@ -1807,7 +2062,7 @@ def check(path: Path | None, fail_on: str, api_url: str, as_json: bool) -> None:
     _table(
         [
             {
-                "status": r.status.upper(),
+                "status": _display_label(r).upper(),
                 "artifact": r.found.name,
                 "platform": r.found.platform,
                 # `r.score` is already a float or None — `_coerce_score` made it
@@ -1823,11 +2078,14 @@ def check(path: Path | None, fail_on: str, api_url: str, as_json: bool) -> None:
         ["status", "artifact", "platform", "score", "scanners", "source"],
     )
     click.echo("")
+    display_counts = {
+        label: sum(1 for r in results if _display_label(r) == label) for label in _DISPLAY_ORDER
+    }
     click.echo(
         "  ".join(
-            click.style(f"{counts[s]} {s}", fg=_STATUS_COLOURS[s])
-            for s in _SUMMARY_ORDER
-            if counts[s]
+            click.style(f"{display_counts[label]} {label.lower()}", fg=_DISPLAY_COLOURS[label])
+            for label in _DISPLAY_ORDER
+            if display_counts[label]
         )
     )
 
@@ -1863,14 +2121,17 @@ def check(path: Path | None, fail_on: str, api_url: str, as_json: bool) -> None:
             click.echo(f"  - {r.found.name}: {r.note}")
 
     click.echo("")
+    # The DOCUMENTED spelling of the level, not the wire token, so the word we
+    # print back is the word we told the user to type.
+    level = FAIL_ON_LABELS[fail_on]
     if exit_code == EXIT_POLICY_VIOLATION:
         click.secho(
-            f"FAIL: {len(violations)} artifact(s) violate --fail-on {fail_on}.", fg="red", bold=True
+            f"FAIL: {len(violations)} artifact(s) violate --fail-on {level}.", fg="red", bold=True
         )
     elif exit_code == EXIT_INCOMPLETE:
         click.secho("INCOMPLETE: some artifacts could not be checked.", fg="red", bold=True)
     else:
-        click.secho(f"PASS: no artifact violates --fail-on {fail_on}.", fg="green", bold=True)
+        click.secho(f"PASS: no artifact violates --fail-on {level}.", fg="green", bold=True)
     sys.exit(exit_code)
 
 

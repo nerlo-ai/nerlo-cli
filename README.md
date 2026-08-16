@@ -41,29 +41,37 @@ nerlo check . --json              # machine-readable, carries the exit code
 ```
 
 ```
-STATUS    ARTIFACT                   PLATFORM  SCORE  SCANNERS  SOURCE
-VERIFIED  todoist                    mcp       95.9   8         ./mcp.json
-CAUTION   acb-tax-mcp                mcp       93.4   9         ./mcp.json
-UNSAFE    accessibility-agents       mcp       -      7         ./mcp.json
-WITHHELD  abap-adt-mcp-server        mcp       -      0         ./mcp.json
-UNKNOWN   totally-made-up-thing-xyz  mcp       -      -         ./mcp.json
-UNRESOLVED app                       mcp       -      -         ./mcp.json
+STATUS       ARTIFACT                   PLATFORM  SCORE  SCANNERS  SOURCE
+CLEAN        todoist                    mcp       95.9   8         ./mcp.json
+CAUTION      acb-tax-mcp                mcp       93.4   9         ./mcp.json
+FLAGGED      accessibility-agents       mcp       41.0   7         ./mcp.json
+SCAN HALTED  abap-adt-mcp-server        mcp       -      3         ./mcp.json
+WITHHELD     abap-adt-mcp-server        mcp       -      0         ./mcp.json
+UNKNOWN      totally-made-up-thing-xyz  mcp       -      -         ./mcp.json
+UNRESOLVED   app                        mcp       -      -         ./mcp.json
 ```
 
 ### Unknown is not safe
 
 The three outcomes are reported distinctly and are never collapsed:
 
-| Status | Meaning |
-|--------|---------|
-| `VERIFIED` | In the registry, aggregate verdict Verified |
-| `CAUTION` | In the registry, aggregate verdict Caution |
-| `UNSAFE` | In the registry, aggregate verdict Unsafe |
-| `WITHHELD` | In the registry — and the registry is **declining to publish a verdict** (insufficient scanner coverage) |
-| `UNSCORED` | In the registry, not yet scored |
-| `UNKNOWN` | **Searched the registry listing to exhaustion and did not find it.** Nobody has scanned this |
-| `UNRESOLVED` | **We do not know.** The search matched more rows than `check` is willing to read, and none of the ones it read were this artifact |
-| `ERROR` | Could not be resolved — the registry did not answer |
+| Status | `--json` `status` | Meaning |
+|--------|-------------------|---------|
+| `CLEAN` | `verified` | In the registry, and no scanner scored it below the threshold |
+| `CAUTION` | `caution` | In the registry, and a scanner found something worth reviewing |
+| `FLAGGED` | `unsafe` | In the registry, and at least one scanner scored it below the threshold |
+| `SCAN HALTED` | `unsafe` | In the registry, and the scan **stopped on a critical finding** before it produced a score. A different fact from `FLAGGED`, and the more common one |
+| `WITHHELD` | `withheld` | In the registry — and the registry is **declining to publish a verdict** (insufficient scanner coverage) |
+| `UNSCORED` | `unscored` | In the registry, not yet scored |
+| `UNKNOWN` | `unknown` | **Searched the registry listing to exhaustion and did not find it.** Nobody has scanned this |
+| `UNRESOLVED` | `unresolved` | **We do not know.** The search matched more rows than `check` is willing to read, and none of the ones it read were this artifact |
+| `ERROR` | `error` | Could not be resolved — the registry did not answer |
+
+The middle column is what `--json` puts in each artifact's `status` field, and it
+is **unchanged** — see [Words vs. wire values](#words-vs-wire-values). `SCAN
+HALTED` has no wire value of its own: it is `unsafe` beside an absent score, and
+it fails every `--fail-on` level that `FLAGGED` does. `--json` also carries a
+`status_label` field with the word from the first column.
 
 `UNKNOWN` is not a pass. Rendering "nobody has looked at this" as a green check
 is the failure this tool exists to prevent, so unknown artifacts get their own
@@ -76,7 +84,7 @@ registry's listing endpoint a page at a time; when it runs out of budget with
 rows still unread it reports what it did not read (`'app' (100 of 787 rows
 read)`) and exits `3`. It does **not** report an unread remainder as an
 absence — that is precisely how eight registry rows named `app`, every one of
-them Unsafe, once produced a green `EXIT 0`.
+them flagged, once produced a green `EXIT 0`.
 
 `UNKNOWN` is also stated as a miss against the **listing**, not as proof of
 absence: the API documents that `undistributed` artifacts "are never listed;
@@ -91,25 +99,48 @@ they remain retrievable by direct id".
 | `2` | Usage error |
 | `3` | **Incomplete** — at least one artifact could not be resolved (registry unreachable, a local config could not be parsed, or a search too broad to read to the end) and nothing outright violated the policy. A check that could not reach the registry has not passed |
 
-A violation outranks an incomplete: if something is already known to be Unsafe,
+A violation outranks an incomplete: if something is already known to be flagged,
 you get `1`, and the unresolved rows are still printed.
 
 ### `--fail-on`
 
 | Level | Fails on |
 |-------|----------|
-| `unsafe` (default) | `UNSAFE` |
-| `caution` | `UNSAFE`, `CAUTION` |
-| `any` | anything not `VERIFIED`, **including `UNKNOWN`** |
+| `flagged` (default) | `FLAGGED`, `SCAN HALTED` |
+| `caution` | `FLAGGED`, `SCAN HALTED`, `CAUTION` |
+| `any` | anything not `CLEAN`, **including `UNKNOWN`** |
 
 `UNRESOLVED` and `ERROR` are in **none** of these levels: "we could not ask" is
 never a policy verdict. They exit `3` at every level — never `0`.
 
-`unsafe` and `caution` are verdict thresholds and deliberately do not fail on
+`flagged` and `caution` are verdict thresholds and deliberately do not fail on
 unknowns — most of the ecosystem is not in the registry yet, and a gate that
 red-builds every repo on day one gets deleted in week one. Use `--fail-on any`
 once you have submitted your dependency set: it means "fail unless the registry
-affirmatively verified this".
+affirmatively rated this clean".
+
+**`--fail-on unsafe` still works and always will.** It is the previous spelling
+of `--fail-on flagged` and means exactly the same thing. Nothing in an existing
+pipeline needs editing; the new spelling is simply the one `--help` documents.
+
+### Words vs. wire values
+
+The words changed. The machine contract did not.
+
+`--json` is unchanged: each artifact's `status` is still `verified` / `caution` /
+`unsafe` / `withheld` / `unscored` / `unknown` / `unresolved` / `error`, `badge`
+is still the registry's `Verified` / `Caution` / `Unsafe`, and `summary` is still
+keyed by those same status values. A pipeline parsing any of them keeps working
+with no edit. Two additive fields are new: `status_label` on each artifact and
+`fail_on_label` at the top level, both carrying the displayed word, so you can
+migrate your own output when you choose to.
+
+Why the words changed: `Unsafe` did not mean unsafe — it meant "at least one
+scanner of eight-to-eleven scored below 60", which sat on the large majority of
+badged artifacts, most of them scoring well overall. `Verified` overclaimed in
+the other direction: Nerlo verifies nothing, it runs independent scanners and
+publishes what they said. `Caution` is unchanged and deliberately so — it is
+advice to a reader rather than an assertion about someone's code.
 
 ### In GitHub Actions
 
@@ -143,9 +174,10 @@ can never be matched.
 
 `nerlo install` respects the composite security badge:
 
-- **Verified** → installs
+- **Clean** → installs
 - **Caution** → warns and asks for confirmation
-- **Unsafe** → refused
+- **Flagged** → refused
+- **Unrated** (no badge published yet) → refused
 
 The registry aggregates evidence from multiple independent scanners; you make the trust decision.
 
