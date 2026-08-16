@@ -1,7 +1,7 @@
 name: Publish to PyPI
 
 # Tokenless publishing via PyPI Trusted Publishing (OIDC) — no API token is
-# stored anywhere. Fires when a GitHub Release is published (or manually).
+# stored anywhere.
 #
 # One-time PyPI setup (repo owner only): pypi.org -> your account ->
 # "Publishing" -> "Add a pending publisher":
@@ -10,15 +10,85 @@ name: Publish to PyPI
 #     Repository name:   nerlo-cli
 #     Workflow name:     publish.yml
 #     Environment name:  pypi
+#
+# WHY THE PUBLISH STEP LIVES IN *THIS* FILE AND CANNOT BE FACTORED OUT.
+# PyPI's trusted publisher is pinned to the workflow FILENAME above. Moving the
+# `pypa/gh-action-pypi-publish` step into a reusable workflow, or into a new
+# `release.yml`, changes the OIDC claim PyPI checks and every publish starts
+# failing until someone edits the pending-publisher config on pypi.org — an
+# owner-only action. So the version-bump trigger was added HERE rather than
+# building a second workflow that calls this one.
+#
+# WHY IT IS NOT "CREATE A RELEASE, LET `release: published` DO THE REST".
+# A release (or tag, or workflow_dispatch) created using the default
+# GITHUB_TOKEN does NOT trigger further workflow runs — GitHub blocks that
+# recursion by design. An automation that opened a release and expected this
+# file to wake up would silently publish nothing, and would look like it
+# worked. Hence: one workflow, three jobs, no cross-workflow handoff.
 
 on:
+  # The automatic path: a version bump lands on main and ships itself.
+  push:
+    branches: [main]
+    paths: ["pyproject.toml"]
+  # The manual path: re-run a publish, or ship a version whose bump commit
+  # predates this workflow. Guarded by the same tag check as the automatic one.
+  workflow_dispatch:
+  # Retained so a hand-cut GitHub Release still publishes, which is how
+  # v0.1.0 and v0.2.0 shipped.
   release:
     types: [published]
-  workflow_dispatch:
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Decide whether there is anything to publish.
+  #
+  # The gate is "does the tag for the version in pyproject.toml already exist".
+  # Tag existence is the right oracle rather than diffing the previous commit:
+  # it is idempotent (a re-run, a revert-and-reland, or a dispatch converge on
+  # the same answer) and it matches the thing we are about to create. A version
+  # comparison against HEAD~1 would republish on any later touch to
+  # pyproject.toml, and PyPI rejects a duplicate version permanently — a
+  # version number can never be reused, so a false positive here is not
+  # recoverable by retrying.
+  # ---------------------------------------------------------------------------
+  detect:
+    name: Is there a new version to ship?
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.check.outputs.should_publish }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need the tag list, not just the tip
+      - id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          # python3, not python: this job runs no setup-python step, and the
+          # bare `python` alias is not guaranteed on the runner image. tomllib
+          # is stdlib from 3.11; the runner's system python3 is newer.
+          version="$(python3 -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${tag} already exists — nothing to publish."
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${version} has no ${tag} yet — will publish."
+          fi
+
   publish:
     name: Build + publish to PyPI (trusted publishing)
+    needs: detect
+    # `release: published` keeps its old unconditional behaviour: the human who
+    # cut the release already decided. The automatic and manual paths defer to
+    # the tag gate.
+    if: github.event_name == 'release' || needs.detect.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -31,3 +101,35 @@ jobs:
       - run: python -m pip install --upgrade build
       - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ---------------------------------------------------------------------------
+  # Tag and release only AFTER PyPI accepted the upload, never before. If the
+  # publish fails, no tag is left behind claiming a version shipped that did
+  # not — and because the gate above is tag existence, a re-run then correctly
+  # tries again instead of skipping.
+  # ---------------------------------------------------------------------------
+  tag-and-release:
+    name: Tag + GitHub Release
+    needs: [detect, publish]
+    if: github.event_name != 'release' && needs.detect.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git tag "$TAG"
+          git push origin "$TAG"
+          # --generate-notes gives the commit list between tags for free. The
+          # narrative notes a human would write are not something CI can invent,
+          # and a wrong summary is worse than an honest changelog.
+          gh release create "$TAG" --title "$TAG" --generate-notes
