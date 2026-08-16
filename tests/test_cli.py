@@ -36,7 +36,7 @@ import httpx
 import pytest
 from click.testing import CliRunner, Result
 
-from nerlo_cli import commands
+from nerlo_cli import _update, commands
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -57,6 +57,19 @@ def _isolate_telemetry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         raise RuntimeError("telemetry client not stubbed for this test")
 
     monkeypatch.setattr(commands, "_telemetry_client", _no_network)
+
+    # The PyPI update check hangs off a `call_on_close` hook on EVERY command
+    # (see `commands.UpdateNoticeCommand`), so without this it would run — and
+    # try to reach pypi.org — in every test in this file. Off by env, and the
+    # fetcher additionally replaced so a regression in the env handling still
+    # cannot produce a real request. `tests/test_update_check.py` is the only
+    # place the notice is deliberately switched on.
+    monkeypatch.setenv("NERLO_UPDATE_CHECK", "0")
+
+    def _no_pypi() -> str | None:
+        raise RuntimeError("update check not stubbed for this test")
+
+    monkeypatch.setattr(_update, "fetch_latest", _no_pypi)
 
 
 def _use_handler(monkeypatch: pytest.MonkeyPatch, handler: Handler) -> None:

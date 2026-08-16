@@ -12,7 +12,7 @@ from importlib import metadata
 
 import click
 
-from nerlo_cli.commands import ALL_COMMANDS
+from nerlo_cli.commands import ALL_COMMANDS, UpdateNoticeCommand
 
 
 @click.group()
@@ -20,7 +20,11 @@ def cli() -> None:
     """Nerlo — MCP server security registry."""
 
 
-@cli.command()
+# `cls=` here too, and for the obvious reason: "what version am I on" is the
+# single most likely moment for "…and a newer one exists" to be useful. The
+# notice goes to stderr, so `nerlo version` still prints exactly one line on
+# stdout for anything parsing it.
+@cli.command(cls=UpdateNoticeCommand)
 def version() -> None:
     """Print the installed nerlo CLI version."""
     try:

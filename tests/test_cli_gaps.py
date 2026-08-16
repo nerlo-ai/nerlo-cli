@@ -40,7 +40,7 @@ import httpx
 import pytest
 from click.testing import CliRunner, Result
 
-from nerlo_cli import _logging, commands, main
+from nerlo_cli import _logging, _update, commands, main
 
 # Bound at import time, BEFORE the autouse fixture below replaces the module
 # attribute — the only way to reach the real factory from a test.
@@ -64,6 +64,16 @@ def _isolate_telemetry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         raise RuntimeError("telemetry client not stubbed for this test")
 
     monkeypatch.setattr(commands, "_telemetry_client", _no_network)
+
+    # Same reasoning as `tests/test_cli.py`: the update check runs on every
+    # command's close hook, so it is switched off here by env AND by replacing
+    # the fetcher, and is exercised only in `tests/test_update_check.py`.
+    monkeypatch.setenv("NERLO_UPDATE_CHECK", "0")
+
+    def _no_pypi() -> str | None:
+        raise RuntimeError("update check not stubbed for this test")
+
+    monkeypatch.setattr(_update, "fetch_latest", _no_pypi)
 
 
 def _use_handler(monkeypatch: pytest.MonkeyPatch, handler: Handler) -> None:

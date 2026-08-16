@@ -83,6 +83,7 @@ from urllib.parse import urlparse
 import click
 import httpx
 
+from nerlo_cli import _update
 from nerlo_cli._logging import get_logger
 
 logger = get_logger(__name__)
@@ -159,6 +160,46 @@ _token_option = click.option(
     help="API bearer token (or set NERLO_API_TOKEN).",
 )
 _json_option = click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON output.")
+
+
+class UpdateNoticeCommand(click.Command):
+    """A command that may print "a newer nerlo exists" to STDERR when it ends.
+
+    WHY A COMMAND CLASS AND NOT SIX CALLS. A notice added to the command
+    bodies is a control applied to the paths somebody happened to think of:
+    the seventh command lands without it, and nothing says so. Carrying it on
+    the class makes "which commands notify" a property of the command table
+    rather than of anyone's diligence — and `tests/test_update_check.py`
+    asserts that every entry in `ALL_COMMANDS` is one of these AND takes
+    `--json`, so a command that opts out has to do it visibly.
+
+    WHY `call_on_close` AND NOT A RETURN-VALUE HOOK. `check` (and every
+    `_fail`) ends in `sys.exit`, which no result callback survives. Click
+    closes the command's context on the way out of `MultiCommand.invoke`
+    regardless — SystemExit included — so a close callback is the one hook
+    that fires on all six commands' success AND failure paths. It also runs
+    after the command's own output, which is where a footnote belongs.
+
+    The notice cannot reach stdout and cannot change an exit code; see the
+    three rules in `nerlo_cli/_update.py`.
+    """
+
+    def invoke(self, ctx: click.Context) -> Any:
+        # Registered BEFORE the body runs, so it still fires when the body
+        # exits non-zero — "your nerlo is old" is most useful next to a
+        # failure, not least.
+        ctx.call_on_close(lambda: self._notify(ctx))
+        return super().invoke(ctx)
+
+    @staticmethod
+    def _notify(ctx: click.Context) -> None:
+        # `as_json` is this CLI's one machine-output switch (`_json_option`).
+        # A command without it — `nerlo version` — reads False and notifies.
+        _update.maybe_notify(
+            _nerlo_home(),
+            as_json=bool(ctx.params.get("as_json")),
+            read_config=_read_config,
+        )
 
 
 def _client(api_url: str, token: str | None = None) -> httpx.Client:
@@ -295,7 +336,7 @@ def verdict_label(badge: Any, raw_score: Any) -> str:
 # --------------------------------------------------------------------- #
 
 
-@click.command()
+@click.command(cls=UpdateNoticeCommand)
 @click.argument("query")
 @_api_url_option
 @_json_option
@@ -343,7 +384,7 @@ def search(query: str, api_url: str, as_json: bool) -> None:
 # --------------------------------------------------------------------- #
 
 
-@click.command()
+@click.command(cls=UpdateNoticeCommand)
 @click.argument("skill_name")
 @_api_url_option
 @_json_option
@@ -631,7 +672,7 @@ def _emit_install_event(api_url: str, target: str, token: str | None) -> None:
 # --------------------------------------------------------------------- #
 
 
-@click.command()
+@click.command(cls=UpdateNoticeCommand)
 @click.argument("skill_name")
 @click.option(
     "--target",
@@ -1002,7 +1043,7 @@ def _install_claude_skill(skill: dict[str, Any], slug: str, *, force: bool) -> P
 # --------------------------------------------------------------------- #
 
 
-@click.command()
+@click.command(cls=UpdateNoticeCommand)
 @click.argument("url")
 @click.option(
     "--type",
@@ -1041,7 +1082,7 @@ def submit(
     click.echo(f"  scan job: {payload.get('scan_job_id')}")
 
 
-@click.command()
+@click.command(cls=UpdateNoticeCommand)
 @click.argument("identifier")
 @_api_url_option
 @_token_option
@@ -1933,7 +1974,7 @@ _DISPLAY_COLOURS: dict[str, str] = {
 }
 
 
-@click.command()
+@click.command(cls=UpdateNoticeCommand)
 @click.argument(
     "path",
     required=False,

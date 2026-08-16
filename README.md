@@ -10,6 +10,66 @@ Nerlo continuously scans, scores, and publishes Model Context Protocol (MCP) ser
 pip install nerlo
 ```
 
+Or, to keep a CLI out of your project environments — either works:
+
+```sh
+pipx install nerlo
+```
+
+```sh
+uv tool install nerlo
+```
+
+## Upgrading
+
+Use the line that matches how you installed it:
+
+```sh
+pip install --upgrade nerlo
+```
+
+```sh
+pipx upgrade nerlo
+```
+
+```sh
+uv tool upgrade nerlo
+```
+
+`nerlo version` prints what you are running now. In GitHub Actions there is
+nothing to upgrade: `pipx run nerlo check .` resolves the latest release on
+every run.
+
+### "a new version is available"
+
+When the version you are running is behind the one on PyPI, `nerlo` says so on
+**stderr** and names the command to fix it:
+
+```
+note: nerlo 0.4.0 is available (you have 0.3.0). Upgrade: pip install --upgrade nerlo
+```
+
+This is how you find out about a fix you are missing — 0.2.0, for instance,
+shipped a broken Windows console-script shim that 0.3.0 repaired. Exactly what
+it does, so you can decide whether you want it:
+
+- **It asks PyPI, at most once a day.** One `GET https://pypi.org/pypi/nerlo/json`, a 1.5s ceiling, no retry. The answer is cached in `~/.nerlo/update-check.json` (or under `NERLO_HOME`) and not asked for again for 24 hours. A failed attempt is cached too, so being offline costs one bounded attempt a day rather than one per command. Deleting the cache file is always safe.
+- **It sends nothing about you.** No identifier, no install id, no usage data, nothing about what you scanned — not even which version you are on. PyPI sees an IP address and the user agent `nerlo-cli`; that is the entire request. It is not telemetry, and nothing about it reaches Nerlo. (Separately, `nerlo install` sends anonymous install telemetry to the registry — a different thing, with its own opt-out below.)
+- **It cannot touch machine output.** Under `--json` it is suppressed completely — no notice, and no request either — so `nerlo check --json` produces byte-identical output with the notice available or switched off. It never changes an exit code, and a failure inside the check is silent.
+- **It is off in CI.** When `CI` is set, the check does not run at all: a pipeline cannot act on the notice, and a security tool should not make unrequested network calls from your build. `NERLO_UPDATE_CHECK=1` forces it on if you want it in your logs.
+
+To switch it off everywhere:
+
+```sh
+export NERLO_UPDATE_CHECK=0
+```
+
+Or permanently, as a line in `~/.nerlo/config`:
+
+```
+update_check=false
+```
+
 ## Usage
 
 ```sh
@@ -187,8 +247,15 @@ The registry aggregates evidence from multiple independent scanners; you make th
 |---------|------|---------|---------|
 | Registry API base URL | `--api-url` | `NERLO_API_BASE_URL` | `https://api.nerlo.ai` |
 | API token (write ops) | `--token` | `NERLO_API_TOKEN` | — |
+| [Update notice](#a-new-version-is-available) | — | `NERLO_UPDATE_CHECK` | on, except when `CI` is set |
+| Anonymous install telemetry | — | `NERLO_TELEMETRY` | on |
+| State/cache directory | — | `NERLO_HOME` | `~/.nerlo` |
 
 `search`, `info` and `check` are unauthenticated — no token needed.
+
+The two network calls you did not ask for are both switchable, by env var
+(`NERLO_UPDATE_CHECK=0`, `NERLO_TELEMETRY=0`) or by a line in `~/.nerlo/config`
+(`update_check=false`, `telemetry=false`).
 
 Set `NERLO_DEBUG=1` for verbose diagnostic logging on stderr.
 
