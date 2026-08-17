@@ -1,12 +1,22 @@
 [project]
 name = "nerlo"
-# 0.3.0: the badge vocabulary change. A MINOR bump, not a patch, because the
-# words every command prints are different — and not a MAJOR one, because the
-# machine contract (`--json` `status`/`badge`/`summary`, the `--fail-on` tokens,
-# the exit codes) is byte-identical to 0.2.0 by design. Merging this does not
-# ship it: `publish.yml` fires on `release: published`, so a GitHub Release
-# against this version is what reaches PyPI.
-version = "0.3.0"
+# 0.4.0: the update notice (#11). A MINOR bump, not a patch, because `nerlo
+# <command>` now writes a line it never wrote before — and not a MAJOR one,
+# because the machine contract (`--json` `status`/`badge`/`summary`, the
+# `--fail-on` tokens, the exit codes) is untouched: the notice goes to STDERR
+# and is suppressed entirely under `--json`.
+#
+# EDITING THIS LINE PUBLISHES. #10 added `push: branches:[main],
+# paths:["pyproject.toml"]` to `publish.yml`, so a bump reaching main ships
+# itself to PyPI — no GitHub Release step, no second approval. The comment that
+# used to sit here said the opposite ("Merging this does not ship it") and was
+# written before that trigger existed; it is corrected rather than deleted so
+# the next person to bump does not trust the old promise. A PyPI version can
+# NEVER be reused, so a wrong number here is not recoverable by reverting.
+#
+# 0.3.0 was the badge vocabulary change: `Verified`/`Unsafe` became
+# `Clean`/`Flagged` in printed output, machine contract byte-identical to 0.2.0.
+version = "0.4.0"
 description = "Nerlo CLI — search, inspect, and install MCP servers from the Nerlo security registry"
 readme = "README.md"
 requires-python = ">=3.11"
